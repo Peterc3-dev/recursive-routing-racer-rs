@@ -1,2 +1,2 @@
 pub mod engine;
-pub use engine::ComputeEngine;
+pub use engine::{ComputeEngine, GpuBuffer};
