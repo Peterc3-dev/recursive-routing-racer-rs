@@ -46,6 +46,8 @@ pub struct LayerWeights {
     pub ffn_down_buf: GpuBuffer,      pub ffn_down_type: QType,     pub ffn_down_k: u32,    pub ffn_down_n: u32,
 }
 
+const MAX_SEQ: usize = 2048;
+
 pub struct Phi4Model {
     pub embedding: Vec<f32>,
     pub output_norm: Vec<f32>,
@@ -53,8 +55,12 @@ pub struct Phi4Model {
     pub buf_a: GpuBuffer,
     pub buf_c: GpuBuffer,
     pub logits_buf: GpuBuffer,
-    pub emb_bufs: Vec<(GpuBuffer, usize)>,  // F32 transposed embedding chunks for logits
+    pub emb_bufs: Vec<(GpuBuffer, usize)>,
     pub rope_factors: Vec<f32>,
+    // GPU attention buffers
+    pub attn_q_buf: GpuBuffer,     // [N_HEADS * HEAD_DIM]
+    pub attn_out_buf: GpuBuffer,   // [N_HEADS * HEAD_DIM]
+    pub kv_bufs: Vec<(GpuBuffer, GpuBuffer)>,  // per-layer (K_cache, V_cache) on GPU
 }
 
 pub struct KVCache {
@@ -275,6 +281,7 @@ impl Phi4Model {
         engine.get_pipeline("matmul_q6k", 3, 8);
         engine.get_pipeline("matmul_tiled", 3, 12);
         engine.get_pipeline("rmsnorm", 3, 8);
+        engine.get_pipeline("attention", 4, 12);  // 4 buffers, 3 push u32s
 
         let mut layers = Vec::with_capacity(N_LAYERS);
         let mut total_gpu: u64 = 0;
@@ -342,10 +349,23 @@ impl Phi4Model {
             emb_bufs.push((buf, n));
             chunk_start = chunk_end;
         }
-        eprintln!("[phi4] Ready: {:.1}s, {:.1}MB layer weights, {} emb chunks",
+        // GPU attention buffers
+        let attn_q_buf = engine.alloc_buffer((D_MODEL as u64) * 4);
+        let attn_out_buf = engine.alloc_buffer((D_MODEL as u64) * 4);
+        let kv_size = (MAX_SEQ * N_KV_HEADS * HEAD_DIM) as u64 * 4;
+        let mut kv_bufs = Vec::with_capacity(N_LAYERS);
+        for _ in 0..N_LAYERS {
+            let kb = engine.alloc_buffer(kv_size);
+            let vb = engine.alloc_buffer(kv_size);
+            kv_bufs.push((kb, vb));
+        }
+        total_gpu += N_LAYERS as u64 * kv_size * 2 + D_MODEL as u64 * 4 * 2;
+
+        eprintln!("[phi4] Ready: {:.1}s, {:.1}MB total GPU ({} emb chunks)",
             t0.elapsed().as_secs_f32(), total_gpu as f64 / 1e6, emb_bufs.len());
 
-        Phi4Model { embedding, output_norm, layers, buf_a, buf_c, logits_buf, emb_bufs, rope_factors }
+        Phi4Model { embedding, output_norm, layers, buf_a, buf_c, logits_buf, emb_bufs, rope_factors,
+                    attn_q_buf, attn_out_buf, kv_bufs }
     }
 
     pub unsafe fn forward(&self, engine: &ComputeEngine, hidden: &mut Vec<f32>, cache: &mut KVCache) -> Vec<f32> {
@@ -376,33 +396,30 @@ impl Phi4Model {
 
             apply_rope(&mut q, pos, N_HEADS, &self.rope_factors);
             apply_rope(&mut k, pos, N_KV_HEADS, &self.rope_factors);
-            cache.k[li].extend_from_slice(&k);
-            cache.v[li].extend_from_slice(&v);
 
-            // Grouped-query attention
+            // Update GPU KV cache: write new K/V at position `pos`
+            let kv_stride = N_KV_HEADS * HEAD_DIM;
+            let kv_off = pos * kv_stride;
+            let (ref kbuf, ref vbuf) = self.kv_bufs[li];
+            let k_dst = (kbuf.mapped as *mut u8).add(kv_off * 4);
+            std::ptr::copy_nonoverlapping(k.as_ptr() as *const u8, k_dst, kv_stride * 4);
+            let v_dst = (vbuf.mapped as *mut u8).add(kv_off * 4);
+            std::ptr::copy_nonoverlapping(v.as_ptr() as *const u8, v_dst, kv_stride * 4);
+
+            // GPU grouped-query attention
             let seq_len = pos + 1;
-            for h in 0..N_HEADS {
-                let kv_h = h / heads_per_kv;
-                let q_head = &q[h * HEAD_DIM..(h + 1) * HEAD_DIM];
-                let mut scores = vec![0.0f32; seq_len];
-                for j in 0..seq_len {
-                    let k_off = j * N_KV_HEADS * HEAD_DIM + kv_h * HEAD_DIM;
-                    let mut dot = 0.0f32;
-                    for d in 0..HEAD_DIM { dot += q_head[d] * cache.k[li][k_off + d]; }
-                    scores[j] = dot * scale;
-                }
-                let max_s = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                let mut sum = 0.0f32;
-                for s in &mut scores { *s = (*s - max_s).exp(); sum += *s; }
-                if sum > 0.0 { for s in &mut scores { *s /= sum; } }
-                let out_head = &mut attn_out[h * HEAD_DIM..(h + 1) * HEAD_DIM];
-                out_head.fill(0.0);
-                for j in 0..seq_len {
-                    let v_off = j * N_KV_HEADS * HEAD_DIM + kv_h * HEAD_DIM;
-                    let w = scores[j];
-                    for d in 0..HEAD_DIM { out_head[d] += w * cache.v[li][v_off + d]; }
-                }
-            }
+            upload(&self.attn_q_buf, &q);
+            let push: [u32; 3] = [seq_len as u32, N_KV_HEADS as u32, heads_per_kv as u32];
+            let pb: Vec<u8> = push.iter().flat_map(|v| v.to_le_bytes()).collect();
+            let kv_bytes = (seq_len * kv_stride) as u64 * 4;
+            engine.dispatch_by_name(
+                "attention",
+                &[&self.attn_q_buf, kbuf, vbuf, &self.attn_out_buf],
+                &[D_MODEL as u64 * 4, kv_bytes, kv_bytes, D_MODEL as u64 * 4],
+                &pb,
+                [N_HEADS as u32, 1, 1],
+            );
+            download(&self.attn_out_buf, &mut attn_out);
 
             // Output projection + residual
             gpu_matmul_kquant(engine, &self.buf_a, &layer.attn_output_buf, &self.buf_c,
