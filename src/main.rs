@@ -38,14 +38,9 @@ fn main() {
             let prompt_tokens = tokenizer.encode(input);
             if prompt_tokens.is_empty() { continue; }
 
-            // Prefill: process all prompt tokens, keep logits from the last one
+            // Prefill: process all prompt tokens through each layer together
             let pt = Instant::now();
-            let mut logits = Vec::new();
-            for (i, &tok) in prompt_tokens.iter().enumerate() {
-                let mut hidden = phi4.embed(tok);
-                let l = phi4.forward(&engine, &mut hidden, &mut cache);
-                if i == prompt_tokens.len() - 1 { logits = l; }
-            }
+            let mut logits = phi4.forward_prefill(&engine, &prompt_tokens, &mut cache);
             let prefill_ms = pt.elapsed().as_millis();
             eprint!("\x1b[90m[prefill {}ms, {} tokens]\x1b[0m ", prefill_ms, prompt_tokens.len());
             std::io::stdout().flush().unwrap();
