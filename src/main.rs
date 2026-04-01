@@ -40,7 +40,11 @@ fn main() {
 
             // Prefill: process all prompt tokens through each layer together
             let pt = Instant::now();
-            let mut logits = phi4.forward_prefill(&engine, &prompt_tokens, &mut cache);
+            let mut logits = Vec::new();
+            for &tok in &prompt_tokens {
+                let mut h = phi4.embed(tok);
+                logits = phi4.forward_gpu(&engine, &mut h, &mut cache);
+            }
             let prefill_ms = pt.elapsed().as_millis();
             eprint!("\x1b[90m[prefill {}ms, {} tokens]\x1b[0m ", prefill_ms, prompt_tokens.len());
             std::io::stdout().flush().unwrap();
@@ -64,7 +68,7 @@ fn main() {
 
                 // Forward pass for next token
                 let mut hidden = phi4.embed(tok);
-                logits = phi4.forward(&engine, &mut hidden, &mut cache);
+                logits = phi4.forward_gpu(&engine, &mut hidden, &mut cache);
             }
 
             let gen_time = gt.elapsed().as_secs_f32();

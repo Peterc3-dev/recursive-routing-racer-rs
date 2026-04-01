@@ -66,11 +66,18 @@ pub struct Phi4Model {
     pub logits_buf: GpuBuffer,
     pub emb_bufs: Vec<(GpuBuffer, usize)>,
     pub rope_factors: Vec<f32>,
-    // GPU attention buffers
-    pub attn_q_buf: GpuBuffer,     // [N_HEADS * HEAD_DIM]
-    pub attn_out_buf: GpuBuffer,   // [N_HEADS * HEAD_DIM]
-    pub kv_bufs: Vec<(GpuBuffer, GpuBuffer)>,  // per-layer (K_cache, V_cache) on GPU
-    pub logit_out_bufs: Vec<GpuBuffer>,  // per-chunk logit output buffers for batching
+    pub attn_q_buf: GpuBuffer,
+    pub attn_out_buf: GpuBuffer,
+    pub kv_bufs: Vec<(GpuBuffer, GpuBuffer)>,
+    pub logit_out_bufs: Vec<GpuBuffer>,
+    // GPU-resident pipeline buffers (zero-CPU forward pass)
+    pub gpu_hidden: GpuBuffer,     // [D_MODEL] — persistent hidden state
+    pub gpu_normed: GpuBuffer,     // [D_MODEL] — post-RMS-norm
+    pub gpu_qkv: GpuBuffer,        // [QKV_DIM] — QKV output / scratch
+    pub gpu_gate_up: GpuBuffer,    // [GATE_UP_DIM] — FFN up output
+    pub gpu_ffn_mid: GpuBuffer,    // [FFN_DIM] — SiLU output
+    pub gpu_tmp: GpuBuffer,        // [D_MODEL] — output proj / FFN down scratch
+    pub gpu_rope_factors: GpuBuffer, // [ROPE_DIM/2] — rope scaling factors on GPU
 }
 
 pub struct KVCache {
@@ -295,6 +302,10 @@ impl Phi4Model {
         engine.get_pipeline("fused_norm_matmul_q4k", 4, 8);
         engine.get_pipeline("fused_norm_matmul_q5k", 4, 8);
         engine.get_pipeline("fused_norm_matmul_q6k", 4, 8);
+        engine.get_pipeline("rope", 2, 20);          // 5 push u32s = 20 bytes
+        engine.get_pipeline("silu_gate", 2, 4);      // 1 push u32
+        engine.get_pipeline("residual_add", 3, 4);   // 1 push u32
+        engine.get_pipeline("kv_store", 3, 12);      // 3 push u32s
 
         let mut layers = Vec::with_capacity(N_LAYERS);
         let mut total_gpu: u64 = 0;
@@ -429,12 +440,23 @@ impl Phi4Model {
             layers[i].ds_ffn_down = ds_dn;
         }
 
+        // GPU-resident pipeline buffers
+        let gpu_hidden = engine.alloc_buffer(D_MODEL as u64 * 4);
+        let gpu_normed = engine.alloc_buffer(D_MODEL as u64 * 4);
+        let gpu_qkv = engine.alloc_buffer(QKV_DIM as u64 * 4);
+        let gpu_gate_up = engine.alloc_buffer(GATE_UP_DIM as u64 * 4);
+        let gpu_ffn_mid = engine.alloc_buffer(FFN_DIM as u64 * 4);
+        let gpu_tmp = engine.alloc_buffer(D_MODEL as u64 * 4);
+        let gpu_rope_factors = engine.alloc_buffer((ROPE_DIM as u64 / 2) * 4);
+        upload(&gpu_rope_factors, &rope_factors);
+
         eprintln!("[phi4] Ready: {:.1}s, {:.1}MB total GPU ({} emb chunks, {} desc sets)",
             t0.elapsed().as_secs_f32(), total_gpu as f64 / 1e6, emb_bufs.len(),
             engine.persistent_desc_sets.len());
 
         Phi4Model { embedding, output_norm, layers, buf_a, buf_c, logits_buf, emb_bufs, rope_factors,
-                    attn_q_buf, attn_out_buf, kv_bufs, logit_out_bufs }
+                    attn_q_buf, attn_out_buf, kv_bufs, logit_out_bufs,
+                    gpu_hidden, gpu_normed, gpu_qkv, gpu_gate_up, gpu_ffn_mid, gpu_tmp, gpu_rope_factors }
     }
 
     /// Helper: build a K-quant matmul dispatch tuple for use with dispatch_batch.
@@ -453,6 +475,170 @@ impl Phi4Model {
             pb,
             [qtype.workgroups(n), 1, 1],
         )
+    }
+
+    /// Zero-CPU forward pass: hidden state stays on GPU for entire layer.
+    /// ONE command buffer submit per layer (11 dispatches with barriers).
+    /// CPU only does embedding upload at start, logit download at end.
+    pub unsafe fn forward_gpu(&self, engine: &ComputeEngine, hidden: &mut Vec<f32>, cache: &mut KVCache) -> Vec<f32> {
+        assert_eq!(hidden.len(), D_MODEL);
+        let pos = cache.len;
+        let heads_per_kv = N_HEADS / N_KV_HEADS;
+        let d = D_MODEL as u32;
+        let kv_stride = (N_KV_HEADS * HEAD_DIM) as u32;
+
+        // Upload hidden state to GPU once
+        upload(&self.gpu_hidden, hidden);
+
+        let norm_push: Vec<u8> = [1u32, d].iter().flat_map(|v| v.to_le_bytes()).collect();
+        let seq_len = pos as u32 + 1;
+        let rope_push: Vec<u8> = [pos as u32, N_HEADS as u32, N_KV_HEADS as u32, HEAD_DIM as u32, ROPE_DIM as u32]
+            .iter().flat_map(|v| v.to_le_bytes()).collect();
+        let kv_store_push: Vec<u8> = [pos as u32, (N_HEADS * HEAD_DIM) as u32, kv_stride]
+            .iter().flat_map(|v| v.to_le_bytes()).collect();
+        let silu_push: Vec<u8> = [FFN_DIM as u32].iter().flat_map(|v| v.to_le_bytes()).collect();
+        let resid_push: Vec<u8> = [d].iter().flat_map(|v| v.to_le_bytes()).collect();
+        let attn_push: Vec<u8> = [seq_len, N_KV_HEADS as u32, heads_per_kv as u32]
+            .iter().flat_map(|v| v.to_le_bytes()).collect();
+
+        let total_rope_pairs = (N_HEADS + N_KV_HEADS) * (ROPE_DIM / 2);
+        let rope_wg = ((total_rope_pairs + 63) / 64) as u32;
+        let kv_store_wg = ((kv_stride + 255) / 256) as u32;
+        let silu_wg = ((FFN_DIM as u32 + 255) / 256) as u32;
+        let resid_wg = ((d + 255) / 256) as u32;
+        let kv_bytes = seq_len as u64 * kv_stride as u64 * 4;
+
+        for (_li, layer) in self.layers.iter().enumerate() {
+            let (ref kbuf, ref vbuf) = self.kv_bufs[_li];
+
+            let qkv_push: Vec<u8> = [layer.attn_qkv_k, layer.attn_qkv_n]
+                .iter().flat_map(|v| v.to_le_bytes()).collect();
+            let bpr_qkv = layer.attn_qkv_k as u64 / 256;
+            let wb_qkv = layer.attn_qkv_n as u64 * bpr_qkv * layer.attn_qkv_type.block_bytes() as u64;
+
+            let out_push: Vec<u8> = [layer.attn_output_k, layer.attn_output_n]
+                .iter().flat_map(|v| v.to_le_bytes()).collect();
+            let bpr_out = layer.attn_output_k as u64 / 256;
+            let wb_out = layer.attn_output_n as u64 * bpr_out * layer.attn_output_type.block_bytes() as u64;
+
+            let up_push: Vec<u8> = [layer.ffn_up_k, layer.ffn_up_n]
+                .iter().flat_map(|v| v.to_le_bytes()).collect();
+            let bpr_up = layer.ffn_up_k as u64 / 256;
+            let wb_up = layer.ffn_up_n as u64 * bpr_up * layer.ffn_up_type.block_bytes() as u64;
+
+            let dn_push: Vec<u8> = [layer.ffn_down_k, layer.ffn_down_n]
+                .iter().flat_map(|v| v.to_le_bytes()).collect();
+            let bpr_dn = layer.ffn_down_k as u64 / 256;
+            let wb_dn = layer.ffn_down_n as u64 * bpr_dn * layer.ffn_down_type.block_bytes() as u64;
+
+            // Build all buffer/size vecs for the 11 dispatches
+            let b_norm1: Vec<&GpuBuffer> = vec![&self.gpu_hidden, &layer.attn_norm_buf, &self.gpu_normed];
+            let s_norm1: Vec<u64> = vec![d as u64*4, d as u64*4, d as u64*4];
+
+            let b_qkv: Vec<&GpuBuffer> = vec![&self.gpu_normed, &layer.attn_qkv_buf, &self.gpu_qkv];
+            let s_qkv: Vec<u64> = vec![layer.attn_qkv_k as u64*4, wb_qkv, layer.attn_qkv_n as u64*4];
+
+            let b_rope: Vec<&GpuBuffer> = vec![&self.gpu_qkv, &self.gpu_rope_factors];
+            let s_rope: Vec<u64> = vec![QKV_DIM as u64*4, (ROPE_DIM as u64/2)*4];
+
+            let b_kvs: Vec<&GpuBuffer> = vec![&self.gpu_qkv, kbuf, vbuf];
+            let s_kvs: Vec<u64> = vec![QKV_DIM as u64*4, kv_bytes, kv_bytes];
+
+            // Attention reads Q from gpu_qkv[0..N_HEADS*HEAD_DIM]
+            let b_attn: Vec<&GpuBuffer> = vec![&self.gpu_qkv, kbuf, vbuf, &self.attn_out_buf];
+            let s_attn: Vec<u64> = vec![D_MODEL as u64*4, kv_bytes, kv_bytes, D_MODEL as u64*4];
+
+            let b_out: Vec<&GpuBuffer> = vec![&self.attn_out_buf, &layer.attn_output_buf, &self.gpu_tmp];
+            let s_out: Vec<u64> = vec![layer.attn_output_k as u64*4, wb_out, layer.attn_output_n as u64*4];
+
+            let b_res1: Vec<&GpuBuffer> = vec![&self.gpu_hidden, &self.gpu_tmp, &self.gpu_hidden];
+            let s_res1: Vec<u64> = vec![d as u64*4, d as u64*4, d as u64*4];
+
+            let b_norm2: Vec<&GpuBuffer> = vec![&self.gpu_hidden, &layer.ffn_norm_buf, &self.gpu_normed];
+            let s_norm2: Vec<u64> = vec![d as u64*4, d as u64*4, d as u64*4];
+
+            let b_up: Vec<&GpuBuffer> = vec![&self.gpu_normed, &layer.ffn_up_buf, &self.gpu_gate_up];
+            let s_up: Vec<u64> = vec![layer.ffn_up_k as u64*4, wb_up, layer.ffn_up_n as u64*4];
+
+            let b_silu: Vec<&GpuBuffer> = vec![&self.gpu_gate_up, &self.gpu_ffn_mid];
+            let s_silu: Vec<u64> = vec![GATE_UP_DIM as u64*4, FFN_DIM as u64*4];
+
+            let b_dn: Vec<&GpuBuffer> = vec![&self.gpu_ffn_mid, &layer.ffn_down_buf, &self.gpu_tmp];
+            let s_dn: Vec<u64> = vec![layer.ffn_down_k as u64*4, wb_dn, layer.ffn_down_n as u64*4];
+
+            let b_res2: Vec<&GpuBuffer> = vec![&self.gpu_hidden, &self.gpu_tmp, &self.gpu_hidden];
+            let s_res2: Vec<u64> = vec![d as u64*4, d as u64*4, d as u64*4];
+
+            // 11 dispatches, ONE submit
+            engine.dispatch_batch(&[
+                // 1. RMS norm (attn)
+                ("rmsnorm", &b_norm1, &s_norm1, &norm_push, [1, 1, 1]),
+                // 2. QKV matmul
+                (layer.attn_qkv_type.shader_name(), &b_qkv, &s_qkv, &qkv_push, [layer.attn_qkv_type.workgroups(layer.attn_qkv_n), 1, 1]),
+                // 3. RoPE (in-place on qkv)
+                ("rope", &b_rope, &s_rope, &rope_push, [rope_wg, 1, 1]),
+                // 4. KV store (copy K,V from qkv to cache)
+                ("kv_store", &b_kvs, &s_kvs, &kv_store_push, [kv_store_wg, 1, 1]),
+                // 5. Attention
+                ("attention", &b_attn, &s_attn, &attn_push, [N_HEADS as u32, 1, 1]),
+                // 6. Output projection
+                (layer.attn_output_type.shader_name(), &b_out, &s_out, &out_push, [layer.attn_output_type.workgroups(layer.attn_output_n), 1, 1]),
+                // 7. Residual add (hidden += output_proj)
+                ("residual_add", &b_res1, &s_res1, &resid_push, [resid_wg, 1, 1]),
+                // 8. RMS norm (FFN)
+                ("rmsnorm", &b_norm2, &s_norm2, &norm_push, [1, 1, 1]),
+                // 9. FFN up
+                (layer.ffn_up_type.shader_name(), &b_up, &s_up, &up_push, [layer.ffn_up_type.workgroups(layer.ffn_up_n), 1, 1]),
+                // 10. SiLU gate
+                ("silu_gate", &b_silu, &s_silu, &silu_push, [silu_wg, 1, 1]),
+                // 11. FFN down
+                (layer.ffn_down_type.shader_name(), &b_dn, &s_dn, &dn_push, [layer.ffn_down_type.workgroups(layer.ffn_down_n), 1, 1]),
+                // 12. Residual add (hidden += ffn_down)
+                ("residual_add", &b_res2, &s_res2, &resid_push, [resid_wg, 1, 1]),
+            ]);
+        }
+
+        cache.len += 1;
+
+        // Download hidden state once after all 32 layers
+        download(&self.gpu_hidden, hidden);
+
+        // Output norm + logits (still CPU+GPU hybrid for now)
+        let mut norm = vec![0.0f32; D_MODEL];
+        rms_norm(hidden, &self.output_norm, &mut norm);
+        upload(&self.buf_a, &norm);
+
+        let mk = 1u32;
+        let kk = D_MODEL as u32;
+        let mut dispatches_data: Vec<(Vec<u8>, [u32; 3], usize)> = Vec::new();
+        for (i, (_, chunk_n)) in self.emb_bufs.iter().enumerate() {
+            let n = *chunk_n as u32;
+            let push: [u32; 3] = [mk, kk, n];
+            let pb: Vec<u8> = push.iter().flat_map(|v| v.to_le_bytes()).collect();
+            dispatches_data.push((pb, [(n + 15) / 16, (mk + 15) / 16, 1], i));
+        }
+        let dispatches: Vec<(&str, Vec<&GpuBuffer>, Vec<u64>, &[u8], [u32; 3])> = dispatches_data.iter()
+            .map(|(pb, groups, i)| {
+                let n = self.emb_bufs[*i].1;
+                ("matmul_tiled",
+                 vec![&self.buf_a, &self.emb_bufs[*i].0, &self.logit_out_bufs[*i]],
+                 vec![(mk as u64)*(kk as u64)*4, (kk as u64)*(n as u64)*4, (mk as u64)*(n as u64)*4],
+                 pb.as_slice(), *groups)
+            }).collect();
+        let dispatch_refs: Vec<(&str, &[&GpuBuffer], &[u64], &[u8], [u32; 3])> = dispatches.iter()
+            .map(|(name, bufs, sizes, push, groups)| (*name, bufs.as_slice(), sizes.as_slice(), *push, *groups))
+            .collect();
+        engine.dispatch_batch_parallel(&dispatch_refs);
+
+        let mut logits = vec![0.0f32; VOCAB_SIZE];
+        let mut vocab_offset = 0usize;
+        for (i, (_, chunk_n)) in self.emb_bufs.iter().enumerate() {
+            let n = *chunk_n;
+            let src = std::slice::from_raw_parts(self.logit_out_bufs[i].mapped as *const f32, n);
+            logits[vocab_offset..vocab_offset + n].copy_from_slice(src);
+            vocab_offset += n;
+        }
+        logits
     }
 
     pub unsafe fn forward(&self, engine: &ComputeEngine, hidden: &mut Vec<f32>, cache: &mut KVCache) -> Vec<f32> {
