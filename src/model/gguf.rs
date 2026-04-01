@@ -161,6 +161,7 @@ impl GGUFModel {
         let alignment = metadata.get("general.alignment")
             .and_then(|v| v.as_u64()).unwrap_or(32) as usize;
         let data_offset = (r.pos + alignment - 1) / alignment * alignment;
+        eprintln!("[GGUF] data_offset={}, header_end={}", data_offset, r.pos);
         
         GGUFModel {
             version, n_tensors, metadata, tensor_infos,

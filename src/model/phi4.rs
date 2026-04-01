@@ -1,19 +1,11 @@
-//! Phi-4 Mini forward pass — full transformer with GPU-accelerated Q4 matmul.
-//!
-//! Strategy: Weights quantized to Q4 on CPU during load, stored persistently on
-//! GPU as packed uint32 nibbles + f32 scales. Per-dispatch, only the small
-//! activation vector is uploaded. The matmul_q4 shader dequantizes weights on
-//! the fly in shared memory.
-//!
-//! Memory: ~1.9GB GPU for all 32 layers (vs 7.5GB for F32).
-//! Performance: matmul_q4 shader verified at ~398us per dispatch.
+//! Phi-4 Mini forward pass — native K-quant shaders (Q4_K/Q5_K/Q6_K).
+//! Route 4: Read GGUF blocks directly in shader. Zero requantization loss.
+//! ~1.4GB GPU for 32 layers.
 
 use crate::gpu::{ComputeEngine, GpuBuffer};
 use crate::model::gguf::GGUFModel;
-use rayon::prelude::*;
 use std::time::Instant;
 
-// Architecture constants
 const D_MODEL: usize = 3072;
 const N_HEADS: usize = 24;
 const N_KV_HEADS: usize = 8;
@@ -22,232 +14,134 @@ const FFN_DIM: usize = 8192;
 const N_LAYERS: usize = 32;
 const VOCAB_SIZE: usize = 200064;
 const RMS_EPS: f32 = 1e-5;
-const QKV_DIM: usize = N_HEADS * HEAD_DIM + 2 * N_KV_HEADS * HEAD_DIM; // 5120
-const GATE_UP_DIM: usize = 2 * FFN_DIM; // 16384
-const Q4_BLOCK_SIZE: usize = 32;
+const QKV_DIM: usize = N_HEADS * HEAD_DIM + 2 * N_KV_HEADS * HEAD_DIM;
+const GATE_UP_DIM: usize = 2 * FFN_DIM;
 
-/// Per-layer weights — Q4 packed on GPU
+const ROPE_DIM: usize = 96;
+const ROPE_THETA: f32 = 10000.0;
+
+/// Quant type determines which shader + block size to use
+#[derive(Clone, Copy)]
+enum QType { Q4K, Q5K, Q6K }
+
+impl QType {
+    fn shader_name(&self) -> &str {
+        match self { QType::Q4K => "matmul_q4k", QType::Q5K => "matmul_q5k", QType::Q6K => "matmul_q6k" }
+    }
+    fn block_bytes(&self) -> usize {
+        match self { QType::Q4K => 144, QType::Q5K => 176, QType::Q6K => 210 }
+    }
+    fn from_gguf(typ: u32) -> Self {
+        match typ { 12 => QType::Q4K, 13 => QType::Q5K, 14 => QType::Q6K, _ => panic!("Unsupported quant type {}", typ) }
+    }
+}
+
+/// Per-layer weights — raw GGUF K-quant bytes on GPU
 pub struct LayerWeights {
-    pub attn_norm: Vec<f32>,
     pub attn_norm_buf: GpuBuffer,
-    pub ffn_norm: Vec<f32>,
     pub ffn_norm_buf: GpuBuffer,
-    // Q4 packed weights (uint32, 8 nibbles per word) + scales (f32, one per block of 32)
-    pub attn_qkv_packed: GpuBuffer,
-    pub attn_qkv_scales: GpuBuffer,
-    pub attn_output_packed: GpuBuffer,
-    pub attn_output_scales: GpuBuffer,
-    pub ffn_up_packed: GpuBuffer,
-    pub ffn_up_scales: GpuBuffer,
-    pub ffn_down_packed: GpuBuffer,
-    pub ffn_down_scales: GpuBuffer,
+    pub attn_qkv_buf: GpuBuffer,     pub attn_qkv_type: QType,     pub attn_qkv_k: u32,   pub attn_qkv_n: u32,
+    pub attn_output_buf: GpuBuffer,   pub attn_output_type: QType,  pub attn_output_k: u32, pub attn_output_n: u32,
+    pub ffn_up_buf: GpuBuffer,        pub ffn_up_type: QType,       pub ffn_up_k: u32,      pub ffn_up_n: u32,
+    pub ffn_down_buf: GpuBuffer,      pub ffn_down_type: QType,     pub ffn_down_k: u32,    pub ffn_down_n: u32,
 }
 
-/// Full Phi-4 Mini model
 pub struct Phi4Model {
-    pub embedding: Vec<f32>,       // [VOCAB_SIZE * D_MODEL]
-    pub output_norm: Vec<f32>,     // [D_MODEL]
+    pub embedding: Vec<f32>,
+    pub output_norm: Vec<f32>,
     pub layers: Vec<LayerWeights>,
-    // Shared GPU buffers (reused per dispatch)
     pub buf_a: GpuBuffer,
+    pub buf_c: GpuBuffer,
     pub logits_buf: GpuBuffer,
-    pub buf_c: GpuBuffer,          // output (float32)
-    // Q4-packed embedding chunks on GPU — persistent, uploaded once at load time
-    // Each entry: (packed_buf, scales_buf, chunk_n) for a [D_MODEL, chunk_n] slice
-    pub emb_packed_bufs: Vec<(GpuBuffer, GpuBuffer, usize)>,
+    pub emb_bufs: Vec<(GpuBuffer, usize)>,  // F32 transposed embedding chunks for logits
+    pub rope_factors: Vec<f32>,
+}
+
+pub struct KVCache {
+    pub k: Vec<Vec<f32>>,
+    pub v: Vec<Vec<f32>>,
+    pub len: usize,
+}
+
+impl KVCache {
+    pub fn new() -> Self {
+        KVCache {
+            k: (0..N_LAYERS).map(|_| Vec::with_capacity(512 * N_KV_HEADS * HEAD_DIM)).collect(),
+            v: (0..N_LAYERS).map(|_| Vec::with_capacity(512 * N_KV_HEADS * HEAD_DIM)).collect(),
+            len: 0,
+        }
+    }
+}
+
+fn apply_rope(x: &mut [f32], pos: usize, n_heads: usize, rope_factors: &[f32]) {
+    for h in 0..n_heads {
+        let base = h * HEAD_DIM;
+        for i in 0..(ROPE_DIM / 2) {
+            let base_freq = 1.0 / ROPE_THETA.powf(2.0 * i as f32 / ROPE_DIM as f32);
+            let factor = if i < rope_factors.len() { rope_factors[i] } else { 1.0 };
+            let freq = base_freq / factor;
+            let angle = pos as f32 * freq;
+            let (sin_t, cos_t) = angle.sin_cos();
+            let x0 = x[base + 2 * i];
+            let x1 = x[base + 2 * i + 1];
+            x[base + 2 * i] = x0 * cos_t - x1 * sin_t;
+            x[base + 2 * i + 1] = x0 * sin_t + x1 * cos_t;
+        }
+    }
 }
 
 // ============================================================================
-// Q4 Quantization — CPU side
+// GGUF dequant (CPU, for embedding + norms only)
 // ============================================================================
 
-/// Quantize f32 weights to our simple Q4 format.
-/// Input: row-major [K, N] float32
-/// Output: (packed_u32s, scales)
-///   packed: 8 nibbles per u32, laid out as linear index = k*N + n
-///   scales: [K/32, N] float32, one scale per block of 32 along K
-fn quantize_to_q4(data: &[f32], k: usize, n: usize) -> (Vec<u32>, Vec<f32>) {
-    assert_eq!(data.len(), k * n);
-    let n_scale_blocks = (k + Q4_BLOCK_SIZE - 1) / Q4_BLOCK_SIZE;
-    let mut scales = vec![0.0f32; n_scale_blocks * n];
-    let total_nibbles = k * n;
-    let n_words = (total_nibbles + 7) / 8;
-    let mut packed = vec![0u32; n_words];
-
-    // Compute scales: for each block of 32 along K, for each N column
-    for bk in 0..n_scale_blocks {
-        let k_start = bk * Q4_BLOCK_SIZE;
-        let k_end = (k_start + Q4_BLOCK_SIZE).min(k);
-        for j in 0..n {
-            let mut max_abs: f32 = 0.0;
-            for ki in k_start..k_end {
-                let v = data[ki * n + j].abs();
-                if v > max_abs { max_abs = v; }
-            }
-            // scale such that max_abs maps to +7 (nibble range 1..15 maps to -7..+7)
-            scales[bk * n + j] = if max_abs > 0.0 { max_abs / 7.0 } else { 1.0 };
-        }
-    }
-
-    // Pack nibbles
-    for ki in 0..k {
-        let bk = ki / Q4_BLOCK_SIZE;
-        for j in 0..n {
-            let scale = scales[bk * n + j];
-            let val = data[ki * n + j];
-            // quantize: nibble = round(val / scale) + 8, clamped to [0, 15]
-            let q = (val / scale).round() as i32 + 8;
-            let nibble = q.max(0).min(15) as u32;
-            let linear = ki * n + j;
-            let word_idx = linear / 8;
-            let nibble_idx = linear % 8;
-            packed[word_idx] |= nibble << (nibble_idx * 4);
-        }
-    }
-
-    (packed, scales)
-}
-
-// ============================================================================
-// GGUF Dequantization
-// ============================================================================
-
-fn dequant_q4_k(data: &[u8], n_elements: usize) -> Vec<f32> {
-    let n_blocks = n_elements / 256;
-    let mut out = vec![0.0f32; n_elements];
-    for block_idx in 0..n_blocks {
-        let block = &data[block_idx * 144..];
-        let d = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
-        let dmin = f16_to_f32(u16::from_le_bytes([block[2], block[3]]));
-        let scales = &block[4..16];
-        let qs = &block[16..144];
-        let mut sc = [0u8; 8];
-        let mut mn = [0u8; 8];
-        for i in 0..4 {
-            sc[i] = (scales[i] & 0x3F) as u8;
-            mn[i] = (scales[i + 4] & 0x3F) as u8;
-            sc[i + 4] = ((scales[i] >> 6) | ((scales[i + 8] & 0x0F) << 2)) as u8;
-            mn[i + 4] = ((scales[i + 4] >> 6) | ((scales[i + 8] >> 4) << 2)) as u8;
-        }
-        let base = block_idx * 256;
-        for sub in 0..8 {
-            let s = d * sc[sub] as f32;
-            let m = dmin * mn[sub] as f32;
-            let start = sub * 32;
-            for j in 0..32 {
-                let qi = if j < 16 {
-                    (qs[start / 2 + j] & 0x0F) as f32
-                } else {
-                    ((qs[start / 2 + j - 16] >> 4) & 0x0F) as f32
-                };
-                if base + start + j < n_elements {
-                    out[base + start + j] = qi * s - m;
-                }
-            }
-        }
-    }
-    out
-}
-
-fn dequant_q5_k(data: &[u8], n_elements: usize) -> Vec<f32> {
-    let n_blocks = n_elements / 256;
-    let mut out = vec![0.0f32; n_elements];
-    for block_idx in 0..n_blocks {
-        let block = &data[block_idx * 176..];
-        let d = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
-        let dmin = f16_to_f32(u16::from_le_bytes([block[2], block[3]]));
-        let scales = &block[4..16];
-        let qh = &block[16..48];
-        let qs = &block[48..176];
-        let mut sc = [0u8; 8];
-        let mut mn = [0u8; 8];
-        for i in 0..4 {
-            sc[i] = (scales[i] & 0x3F) as u8;
-            mn[i] = (scales[i + 4] & 0x3F) as u8;
-            sc[i + 4] = ((scales[i] >> 6) | ((scales[i + 8] & 0x0F) << 2)) as u8;
-            mn[i + 4] = ((scales[i + 4] >> 6) | ((scales[i + 8] >> 4) << 2)) as u8;
-        }
-        let base = block_idx * 256;
-        for sub in 0..8 {
-            let s = d * sc[sub] as f32;
-            let m = dmin * mn[sub] as f32;
-            let start = sub * 32;
-            for j in 0..32 {
-                let qi_lo = if j < 16 {
-                    (qs[start / 2 + j] & 0x0F) as u8
-                } else {
-                    ((qs[start / 2 + j - 16] >> 4) & 0x0F) as u8
-                };
-                let global_j = start + j;
-                let qi_hi = ((qh[global_j / 8] >> (global_j % 8)) & 1) as u8;
-                let qi = (qi_lo | (qi_hi << 4)) as f32;
-                if base + global_j < n_elements {
-                    out[base + global_j] = qi * s - m;
-                }
-            }
-        }
-    }
-    out
-}
+fn f16_to_f32(bits: u16) -> f32 { half::f16::from_bits(bits).to_f32() }
 
 fn dequant_q6_k(data: &[u8], n_elements: usize) -> Vec<f32> {
+    // Q6_K: llama.cpp interleaved layout.
+    // Per block (256 elems): [128B ql][64B qh][16B scales][2B d]
+    // Two groups of 128. Each group has 4 quads of 32 elements.
     let n_blocks = n_elements / 256;
     let mut out = vec![0.0f32; n_elements];
-    for block_idx in 0..n_blocks {
-        let block = &data[block_idx * 210..];
-        let ql = &block[0..128];
-        let qh = &block[128..192];
-        let scales = &block[192..208];
-        let d = f16_to_f32(u16::from_le_bytes([block[208], block[209]]));
-        let base = block_idx * 256;
-        for sub in 0..16 {
-            let sc = scales[sub] as i8 as f32;
-            let s = d * sc;
-            for j in 0..16 {
-                let global_j = sub * 16 + j;
-                let ql_byte = ql[global_j / 2];
-                let ql_val = if global_j % 2 == 0 { ql_byte & 0x0F } else { (ql_byte >> 4) & 0x0F };
-                let qh_byte = qh[global_j / 4];
-                let qh_val = (qh_byte >> ((global_j % 4) * 2)) & 0x03;
-                let q = ((ql_val | (qh_val << 4)) as i8 - 32) as f32;
-                if base + global_j < n_elements {
-                    out[base + global_j] = q * s;
-                }
+    for bi in 0..n_blocks {
+        let b = &data[bi * 210..];
+        let ql = &b[0..128];
+        let qh = &b[128..192];
+        let scales = &b[192..208];
+        let d = f16_to_f32(u16::from_le_bytes([b[208], b[209]]));
+        let base = bi * 256;
+
+        for g in 0..2usize {
+            for l in 0..32usize {
+                let ql_lo = ql[g * 64 + l];
+                let ql_hi = ql[g * 64 + l + 32];
+                let qh_byte = qh[g * 32 + l];
+                let is = g * 8;
+
+                let q1 = ((ql_lo & 0x0F) | (((qh_byte >> 0) & 3) << 4)) as i32 - 32;
+                let q2 = ((ql_hi & 0x0F) | (((qh_byte >> 2) & 3) << 4)) as i32 - 32;
+                let q3 = ((ql_lo >> 4) | (((qh_byte >> 4) & 3) << 4)) as i32 - 32;
+                let q4 = ((ql_hi >> 4) | (((qh_byte >> 6) & 3) << 4)) as i32 - 32;
+
+                let pos = base + g * 128;
+                out[pos + l]      = d * (scales[is]     as i8 as f32) * q1 as f32;
+                out[pos + l + 32] = d * (scales[is + 2] as i8 as f32) * q2 as f32;
+                out[pos + l + 64] = d * (scales[is + 4] as i8 as f32) * q3 as f32;
+                out[pos + l + 96] = d * (scales[is + 6] as i8 as f32) * q4 as f32;
             }
         }
     }
     out
 }
 
-fn f16_to_f32(bits: u16) -> f32 {
-    half::f16::from_bits(bits).to_f32()
-}
-
-fn dequant_tensor(gguf: &GGUFModel, name: &str) -> Vec<f32> {
-    let info = gguf.tensor_infos.iter().find(|t| t.name == name)
-        .unwrap_or_else(|| panic!("Tensor not found: {}", name));
+fn dequant_tensor_f32(gguf: &GGUFModel, name: &str) -> Vec<f32> {
+    let info = gguf.tensor_infos.iter().find(|t| t.name == name).unwrap();
     let n_elements: usize = info.shape.iter().product::<u64>() as usize;
     let bytes = gguf.tensor_bytes(name);
     match info.typ {
-        0 => {
-            let f32_slice = unsafe {
-                std::slice::from_raw_parts(bytes.as_ptr() as *const f32, n_elements)
-            };
-            f32_slice.to_vec()
-        }
-        1 => {
-            let f16_slice = unsafe {
-                std::slice::from_raw_parts(bytes.as_ptr() as *const u16, n_elements)
-            };
-            f16_slice.iter().map(|&b| f16_to_f32(b)).collect()
-        }
-        12 => dequant_q4_k(bytes, n_elements),
-        13 => dequant_q5_k(bytes, n_elements),
+        0 => unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const f32, n_elements).to_vec() },
+        1 => unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const u16, n_elements).iter().map(|&b| f16_to_f32(b)).collect() },
         14 => dequant_q6_k(bytes, n_elements),
-        t => {
-            eprintln!("[WARN] Unknown quant type {} for {}, using zeros", t, name);
-            vec![0.0f32; n_elements]
-        }
+        t => panic!("dequant_tensor_f32: unsupported type {} for {}", t, name),
     }
 }
 
@@ -263,16 +157,11 @@ fn rms_norm(x: &[f32], weight: &[f32], out: &mut [f32]) {
     for i in 0..n { out[i] = weight[i] * x[i] * inv_rms; }
 }
 
-fn cpu_gelu(x: &mut [f32]) {
+fn cpu_silu(x: &mut [f32]) {
+    // Phi-4 uses SiLU (Swish), NOT GELU
     for v in x.iter_mut() {
-        let x3 = *v * *v * *v;
-        let inner = 0.7978845608_f32 * (*v + 0.044715 * x3);
-        *v = 0.5 * *v * (1.0 + inner.tanh());
+        *v = *v / (1.0 + (-*v).exp());
     }
-}
-
-fn elemwise_mul(a: &[f32], b: &[f32], out: &mut [f32]) {
-    for i in 0..a.len() { out[i] = a[i] * b[i]; }
 }
 
 fn elemwise_add(a: &[f32], b: &[f32], out: &mut [f32]) {
@@ -284,81 +173,79 @@ fn elemwise_add(a: &[f32], b: &[f32], out: &mut [f32]) {
 // ============================================================================
 
 unsafe fn upload(buf: &GpuBuffer, data: &[f32]) {
-    std::ptr::copy_nonoverlapping(
-        data.as_ptr() as *const u8,
-        buf.mapped as *mut u8,
-        data.len() * 4,
-    );
+    std::ptr::copy_nonoverlapping(data.as_ptr() as *const u8, buf.mapped as *mut u8, data.len() * 4);
 }
 
-unsafe fn upload_u32(buf: &GpuBuffer, data: &[u32]) {
-    std::ptr::copy_nonoverlapping(
-        data.as_ptr() as *const u8,
-        buf.mapped as *mut u8,
-        data.len() * 4,
-    );
+unsafe fn upload_bytes(buf: &GpuBuffer, data: &[u8]) {
+    std::ptr::copy_nonoverlapping(data.as_ptr(), buf.mapped as *mut u8, data.len());
 }
 
 unsafe fn download(buf: &GpuBuffer, out: &mut [f32]) {
-    std::ptr::copy_nonoverlapping(
-        buf.mapped as *const u8,
-        out.as_mut_ptr() as *mut u8,
-        out.len() * 4,
-    );
+    std::ptr::copy_nonoverlapping(buf.mapped as *const u8, out.as_mut_ptr() as *mut u8, out.len() * 4);
 }
 
-/// GPU matmul with Q4 PERSISTENT weights — only uploads activation
-/// Dispatches matmul_q4 shader: A(f32) x B(Q4 packed) -> C(f32)
-/// weight_packed_buf: uint32 packed nibbles [K*N/8 words]
-/// weight_scales_buf: f32 scales [K/32, N]
-unsafe fn gpu_matmul_q4_persistent(
+/// GPU native K-quant matmul: C[N] = A[K] @ Weight_gguf[N, K]
+/// The shader reads raw K-quant blocks and dequantizes on the fly.
+/// No transpose needed — shader accesses GGUF row layout directly.
+unsafe fn gpu_matmul_kquant(
     engine: &ComputeEngine,
-    buf_a: &GpuBuffer,
-    weight_packed_buf: &GpuBuffer,
-    weight_scales_buf: &GpuBuffer,
-    buf_c: &GpuBuffer,
+    buf_a: &GpuBuffer, weight_buf: &GpuBuffer, buf_c: &GpuBuffer,
+    qtype: QType,
+    a: &[f32], c: &mut [f32],
+    k: u32, n: u32,
+) {
+    upload(buf_a, a);
+    let push: [u32; 2] = [k, n];
+    let pb: Vec<u8> = push.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let weight_bytes = (n as u64 / 256) * (k as u64) / 256 * (qtype.block_bytes() as u64) * 256;
+    // Actually: blocks_per_row = K/256, rows = N, total blocks = N * K/256
+    let blocks_per_row = k as u64 / 256;
+    let total_weight_bytes = n as u64 * blocks_per_row * qtype.block_bytes() as u64;
+    engine.dispatch_by_name(
+        qtype.shader_name(),
+        &[buf_a, weight_buf, buf_c],
+        &[k as u64 * 4, total_weight_bytes, n as u64 * 4],
+        &pb,
+        [n, 1, 1],
+    );
+    download(buf_c, c);
+}
+
+/// GPU F32 matmul for logits (embedding is F32)
+unsafe fn gpu_matmul_f32(
+    engine: &ComputeEngine,
+    buf_a: &GpuBuffer, buf_b: &GpuBuffer, buf_c: &GpuBuffer,
     a: &[f32], c: &mut [f32],
     m: u32, k: u32, n: u32,
 ) {
     upload(buf_a, a);
     let push: [u32; 3] = [m, k, n];
     let pb: Vec<u8> = push.iter().flat_map(|v| v.to_le_bytes()).collect();
-
-    let packed_size = ((k as u64) * (n as u64) + 7) / 8 * 4; // bytes for packed u32s
-    let scales_size = ((k as u64 + 31) / 32) * (n as u64) * 4; // bytes for f32 scales
-
     engine.dispatch_by_name(
-        "matmul_q4",
-        &[buf_a, weight_packed_buf, weight_scales_buf, buf_c],
-        &[
-            (m as u64) * (k as u64) * 4,  // BufA size
-            packed_size,                    // BufB packed size
-            scales_size,                    // BufScales size
-            (m as u64) * (n as u64) * 4,  // BufC size
-        ],
+        "matmul_tiled",
+        &[buf_a, buf_b, buf_c],
+        &[(m as u64) * (k as u64) * 4, (k as u64) * (n as u64) * 4, (m as u64) * (n as u64) * 4],
         &pb,
         [(n + 15) / 16, (m + 15) / 16, 1],
     );
     download(buf_c, c);
 }
 
-
-/// GPU RMS norm: out = weight * x / sqrt(mean(x^2) + eps)
 unsafe fn gpu_rmsnorm(
     engine: &ComputeEngine,
     buf_in: &GpuBuffer, weight_buf: &GpuBuffer, buf_out: &GpuBuffer,
     x: &[f32], out: &mut [f32],
-    num_rows: u32, row_size: u32,
 ) {
+    let d = D_MODEL as u32;
     upload(buf_in, x);
-    let push: [u32; 2] = [num_rows, row_size];
+    let push: [u32; 2] = [1, d];
     let pb: Vec<u8> = push.iter().flat_map(|v| v.to_le_bytes()).collect();
     engine.dispatch_by_name(
         "rmsnorm",
         &[buf_in, weight_buf, buf_out],
-        &[(num_rows * row_size) as u64 * 4, row_size as u64 * 4, (num_rows * row_size) as u64 * 4],
+        &[d as u64 * 4, d as u64 * 4, d as u64 * 4],
         &pb,
-        [num_rows, 1, 1],
+        [1, 1, 1],
     );
     download(buf_out, out);
 }
@@ -371,208 +258,163 @@ impl Phi4Model {
     pub unsafe fn load_from_gguf(gguf: &GGUFModel, engine: &mut ComputeEngine) -> Self {
         let t0 = Instant::now();
 
-        eprintln!("[phi4] Dequantizing embedding ({} x {})...", VOCAB_SIZE, D_MODEL);
-        let embedding = dequant_tensor(gguf, "token_embd.weight");
-        assert_eq!(embedding.len(), VOCAB_SIZE * D_MODEL);
-        eprintln!("[phi4] Embedding dequantized: {:.1}s", t0.elapsed().as_secs_f32());
+        eprintln!("[phi4] Loading embedding...");
+        let embedding = dequant_tensor_f32(gguf, "token_embd.weight");
+        let output_norm = dequant_tensor_f32(gguf, "output_norm.weight");
+        let rope_factors = dequant_tensor_f32(gguf, "rope_factors_short.weight");
+        eprintln!("[phi4] Embedding + norms: {:.1}s", t0.elapsed().as_secs_f32());
 
-        let output_norm = dequant_tensor(gguf, "output_norm.weight");
-
-        // Pre-create the matmul_q4 pipeline (4 buffers, 12 bytes push constants)
-        engine.get_pipeline("matmul_q4", 4, 12);
+        // Register pipelines
+        engine.get_pipeline("matmul_q4k", 3, 8);
+        engine.get_pipeline("matmul_q5k", 3, 8);
+        engine.get_pipeline("matmul_q6k", 3, 8);
         engine.get_pipeline("matmul_tiled", 3, 12);
         engine.get_pipeline("rmsnorm", 3, 8);
 
         let mut layers = Vec::with_capacity(N_LAYERS);
+        let mut total_gpu: u64 = 0;
+
         for i in 0..N_LAYERS {
             let prefix = format!("blk.{}", i);
 
-            // Dequant to F32 on CPU, then re-quantize to our simple Q4 format
-            // This works regardless of the original GGUF quant type
+            // Upload raw GGUF bytes to GPU — NO dequant, NO transpose, NO requant
+            let mut load_weight = |name: &str| -> (GpuBuffer, QType, u32, u32) {
+                let info = gguf.tensor_infos.iter().find(|t| t.name == name).unwrap();
+                let qtype = QType::from_gguf(info.typ);
+                let ne0 = info.shape[0] as u32;  // K (input dim, fast)
+                let ne1 = info.shape[1] as u32;  // N (output dim)
+                let raw_bytes = gguf.tensor_bytes(name);
+                let buf = engine.alloc_buffer(raw_bytes.len() as u64);
+                upload_bytes(&buf, raw_bytes);
+                total_gpu += raw_bytes.len() as u64;
+                (buf, qtype, ne0, ne1)
+            };
 
-            // QKV: [D_MODEL, QKV_DIM] = [3072, 5120]
-            let qkv_f32 = dequant_tensor(gguf, &format!("{}.attn_qkv.weight", prefix));
-            let (qkv_packed, qkv_scales) = quantize_to_q4(&qkv_f32, D_MODEL, QKV_DIM);
-            drop(qkv_f32); // free CPU memory immediately
-            let qkv_packed_buf = engine.alloc_buffer(qkv_packed.len() as u64 * 4);
-            upload_u32(&qkv_packed_buf, &qkv_packed);
-            let qkv_scales_buf = engine.alloc_buffer(qkv_scales.len() as u64 * 4);
-            upload(&qkv_scales_buf, &qkv_scales);
+            let (qkv_buf, qkv_t, qkv_k, qkv_n) = load_weight(&format!("{}.attn_qkv.weight", prefix));
+            let (out_buf, out_t, out_k, out_n) = load_weight(&format!("{}.attn_output.weight", prefix));
+            let (up_buf, up_t, up_k, up_n) = load_weight(&format!("{}.ffn_up.weight", prefix));
+            let (down_buf, down_t, down_k, down_n) = load_weight(&format!("{}.ffn_down.weight", prefix));
 
-            // Output proj: [D_MODEL, D_MODEL] = [3072, 3072]
-            let out_f32 = dequant_tensor(gguf, &format!("{}.attn_output.weight", prefix));
-            let (out_packed, out_scales) = quantize_to_q4(&out_f32, D_MODEL, D_MODEL);
-            drop(out_f32);
-            let out_packed_buf = engine.alloc_buffer(out_packed.len() as u64 * 4);
-            upload_u32(&out_packed_buf, &out_packed);
-            let out_scales_buf = engine.alloc_buffer(out_scales.len() as u64 * 4);
-            upload(&out_scales_buf, &out_scales);
-
-            // FFN up: [D_MODEL, GATE_UP_DIM] = [3072, 16384]
-            let up_f32 = dequant_tensor(gguf, &format!("{}.ffn_up.weight", prefix));
-            let (up_packed, up_scales) = quantize_to_q4(&up_f32, D_MODEL, GATE_UP_DIM);
-            drop(up_f32);
-            let up_packed_buf = engine.alloc_buffer(up_packed.len() as u64 * 4);
-            upload_u32(&up_packed_buf, &up_packed);
-            let up_scales_buf = engine.alloc_buffer(up_scales.len() as u64 * 4);
-            upload(&up_scales_buf, &up_scales);
-
-            // FFN down: [FFN_DIM, D_MODEL] = [8192, 3072]
-            let down_f32 = dequant_tensor(gguf, &format!("{}.ffn_down.weight", prefix));
-            let (down_packed, down_scales) = quantize_to_q4(&down_f32, FFN_DIM, D_MODEL);
-            drop(down_f32);
-            let down_packed_buf = engine.alloc_buffer(down_packed.len() as u64 * 4);
-            upload_u32(&down_packed_buf, &down_packed);
-            let down_scales_buf = engine.alloc_buffer(down_scales.len() as u64 * 4);
-            upload(&down_scales_buf, &down_scales);
-
-            let attn_norm_data = dequant_tensor(gguf, &format!("{}.attn_norm.weight", prefix));
-            let ffn_norm_data = dequant_tensor(gguf, &format!("{}.ffn_norm.weight", prefix));
+            let attn_norm = dequant_tensor_f32(gguf, &format!("{}.attn_norm.weight", prefix));
             let attn_norm_buf = engine.alloc_buffer(D_MODEL as u64 * 4);
-            upload(&attn_norm_buf, &attn_norm_data);
+            upload(&attn_norm_buf, &attn_norm);
+            let ffn_norm = dequant_tensor_f32(gguf, &format!("{}.ffn_norm.weight", prefix));
             let ffn_norm_buf = engine.alloc_buffer(D_MODEL as u64 * 4);
-            upload(&ffn_norm_buf, &ffn_norm_data);
+            upload(&ffn_norm_buf, &ffn_norm);
+
             layers.push(LayerWeights {
-                attn_norm: attn_norm_data,
-                attn_norm_buf,
-                ffn_norm: ffn_norm_data,
-                ffn_norm_buf,
-                attn_qkv_packed: qkv_packed_buf,
-                attn_qkv_scales: qkv_scales_buf,
-                attn_output_packed: out_packed_buf,
-                attn_output_scales: out_scales_buf,
-                ffn_up_packed: up_packed_buf,
-                ffn_up_scales: up_scales_buf,
-                ffn_down_packed: down_packed_buf,
-                ffn_down_scales: down_scales_buf,
+                attn_norm_buf, ffn_norm_buf,
+                attn_qkv_buf: qkv_buf, attn_qkv_type: qkv_t, attn_qkv_k: qkv_k, attn_qkv_n: qkv_n,
+                attn_output_buf: out_buf, attn_output_type: out_t, attn_output_k: out_k, attn_output_n: out_n,
+                ffn_up_buf: up_buf, ffn_up_type: up_t, ffn_up_k: up_k, ffn_up_n: up_n,
+                ffn_down_buf: down_buf, ffn_down_type: down_t, ffn_down_k: down_k, ffn_down_n: down_n,
             });
+
             if i % 8 == 7 || i == N_LAYERS - 1 {
-                eprintln!("[phi4] Layer {} quantized + uploaded: {:.1}s", i, t0.elapsed().as_secs_f32());
+                eprintln!("[phi4] Layer {}: {:.1}s ({:.1}MB GPU)", i, t0.elapsed().as_secs_f32(), total_gpu as f64 / 1e6);
             }
         }
 
-        // Shared GPU buffers for activation I/O:
-        //   A: max input size = FFN_DIM = 8192 floats
-        //   C: max output size = GATE_UP_DIM = 16384 floats
-        let buf_a = engine.alloc_buffer((FFN_DIM as u64) * 4);
+        let buf_a = engine.alloc_buffer((GATE_UP_DIM as u64) * 4);
         let buf_c = engine.alloc_buffer((GATE_UP_DIM as u64) * 4);
-
-        // Calculate approximate GPU memory usage
-        let per_layer_packed = (D_MODEL * QKV_DIM + D_MODEL * D_MODEL
-            + D_MODEL * GATE_UP_DIM + FFN_DIM * D_MODEL) / 2; // nibbles -> bytes
-        let per_layer_scales = ((D_MODEL / Q4_BLOCK_SIZE) * QKV_DIM
-            + (D_MODEL / Q4_BLOCK_SIZE) * D_MODEL
-            + (D_MODEL / Q4_BLOCK_SIZE) * GATE_UP_DIM
-            + (FFN_DIM / Q4_BLOCK_SIZE) * D_MODEL) * 4; // f32 bytes
-        let total_gpu_mb = (N_LAYERS * (per_layer_packed + per_layer_scales)) as f64 / 1024.0 / 1024.0;
-        eprintln!("[phi4] GPU memory: ~{:.1}MB Q4 weights ({} layers)", total_gpu_mb, N_LAYERS);
-
-        eprintln!("[phi4] Ready in {:.1}s — {} layers, d={}, Q4 persistent weights",
-            t0.elapsed().as_secs_f32(), N_LAYERS, D_MODEL);
-
         let logits_buf = engine.alloc_buffer(8192 * 4);
 
-        // Q4 pack the embedding in chunks and upload to persistent GPU buffers.
-        // Embedding is [VOCAB_SIZE, D_MODEL] row-major. For logits we need
-        // [1, D_MODEL] @ [D_MODEL, chunk_n], so we transpose into [D_MODEL, chunk_n]
-        // chunks and Q4-pack each one.
+        // F32 embedding chunks for logits (need transpose for matmul_tiled)
         let chunk_size: usize = 8192;
-        let mut emb_packed_bufs = Vec::new();
-        let et0 = Instant::now();
+        let mut emb_bufs = Vec::new();
         let mut chunk_start = 0usize;
         while chunk_start < VOCAB_SIZE {
             let chunk_end = (chunk_start + chunk_size).min(VOCAB_SIZE);
             let n = chunk_end - chunk_start;
-
-            // Transpose [vocab_chunk, D_MODEL] -> [D_MODEL, n]
             let mut transposed = vec![0.0f32; D_MODEL * n];
             for d in 0..D_MODEL {
                 for v in 0..n {
                     transposed[d * n + v] = embedding[(chunk_start + v) * D_MODEL + d];
                 }
             }
-
-            let (packed, scales) = quantize_to_q4(&transposed, D_MODEL, n);
-            drop(transposed);
-
-            let packed_buf = engine.alloc_buffer(packed.len() as u64 * 4);
-            upload_u32(&packed_buf, &packed);
-            let scales_buf = engine.alloc_buffer(scales.len() as u64 * 4);
-            upload(&scales_buf, &scales);
-
-            emb_packed_bufs.push((packed_buf, scales_buf, n));
+            let buf = engine.alloc_buffer((D_MODEL * n) as u64 * 4);
+            upload(&buf, &transposed);
+            emb_bufs.push((buf, n));
             chunk_start = chunk_end;
         }
-        let emb_gpu_bytes: u64 = emb_packed_bufs.iter().map(|(p, s, _)| p.capacity + s.capacity).sum();
-        eprintln!("[phi4] Embedding Q4 packed: {} chunks, {:.1}MB GPU, {:.1}s",
-            emb_packed_bufs.len(), emb_gpu_bytes as f64 / 1024.0 / 1024.0,
-            et0.elapsed().as_secs_f32());
+        eprintln!("[phi4] Ready: {:.1}s, {:.1}MB layer weights, {} emb chunks",
+            t0.elapsed().as_secs_f32(), total_gpu as f64 / 1e6, emb_bufs.len());
 
-        Phi4Model { embedding, output_norm, layers, buf_a, buf_c, logits_buf, emb_packed_bufs }
+        Phi4Model { embedding, output_norm, layers, buf_a, buf_c, logits_buf, emb_bufs, rope_factors }
     }
 
-    pub unsafe fn forward(&self, engine: &ComputeEngine, hidden: &mut Vec<f32>) -> Vec<f32> {
+    pub unsafe fn forward(&self, engine: &ComputeEngine, hidden: &mut Vec<f32>, cache: &mut KVCache) -> Vec<f32> {
         assert_eq!(hidden.len(), D_MODEL);
-
+        let pos = cache.len;
         let mut norm = vec![0.0f32; D_MODEL];
         let mut qkv = vec![0.0f32; QKV_DIM];
         let mut attn_out = vec![0.0f32; D_MODEL];
         let mut gate_up = vec![0.0f32; GATE_UP_DIM];
         let mut ffn_mid = vec![0.0f32; FFN_DIM];
         let mut tmp = vec![0.0f32; D_MODEL];
+        let heads_per_kv = N_HEADS / N_KV_HEADS;
+        let scale = 1.0 / (HEAD_DIM as f32).sqrt();
 
         for (li, layer) in self.layers.iter().enumerate() {
-            // === Attention ===
-            gpu_rmsnorm(engine, &self.buf_a, &layer.attn_norm_buf, &self.buf_c,
-                hidden, &mut norm, 1, D_MODEL as u32);
+            gpu_rmsnorm(engine, &self.buf_a, &layer.attn_norm_buf, &self.buf_c, hidden, &mut norm);
 
-            // QKV: [1,3072] x [3072,5120] = [1,5120]
-            gpu_matmul_q4_persistent(engine,
-                &self.buf_a, &layer.attn_qkv_packed, &layer.attn_qkv_scales, &self.buf_c,
-                &norm, &mut qkv,
-                1, D_MODEL as u32, QKV_DIM as u32);
+            // QKV via native K-quant shader
+            gpu_matmul_kquant(engine, &self.buf_a, &layer.attn_qkv_buf, &self.buf_c,
+                layer.attn_qkv_type, &norm, &mut qkv, layer.attn_qkv_k, layer.attn_qkv_n);
 
-            // Split Q/K/V and apply attention (seq=1: output = V per head via GQA)
-            let v_start = N_HEADS * HEAD_DIM + N_KV_HEADS * HEAD_DIM;
-            let heads_per_kv = N_HEADS / N_KV_HEADS;
+            let q_end = N_HEADS * HEAD_DIM;
+            let k_end = q_end + N_KV_HEADS * HEAD_DIM;
+            let mut q = qkv[..q_end].to_vec();
+            let mut k = qkv[q_end..k_end].to_vec();
+            let v = qkv[k_end..].to_vec();
+
+            apply_rope(&mut q, pos, N_HEADS, &self.rope_factors);
+            apply_rope(&mut k, pos, N_KV_HEADS, &self.rope_factors);
+            cache.k[li].extend_from_slice(&k);
+            cache.v[li].extend_from_slice(&v);
+
+            let seq_len = pos + 1;
             for h in 0..N_HEADS {
                 let kv_h = h / heads_per_kv;
-                let v_head = &qkv[v_start + kv_h * HEAD_DIM..v_start + (kv_h + 1) * HEAD_DIM];
-                attn_out[h * HEAD_DIM..(h + 1) * HEAD_DIM].copy_from_slice(v_head);
+                let q_head = &q[h * HEAD_DIM..(h + 1) * HEAD_DIM];
+                let mut scores = vec![0.0f32; seq_len];
+                for j in 0..seq_len {
+                    let k_off = j * N_KV_HEADS * HEAD_DIM + kv_h * HEAD_DIM;
+                    let mut dot = 0.0f32;
+                    for d in 0..HEAD_DIM { dot += q_head[d] * cache.k[li][k_off + d]; }
+                    scores[j] = dot * scale;
+                }
+                let max_s = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let mut sum = 0.0f32;
+                for s in &mut scores { *s = (*s - max_s).exp(); sum += *s; }
+                if sum > 0.0 { for s in &mut scores { *s /= sum; } }
+                let out_head = &mut attn_out[h * HEAD_DIM..(h + 1) * HEAD_DIM];
+                out_head.fill(0.0);
+                for j in 0..seq_len {
+                    let v_off = j * N_KV_HEADS * HEAD_DIM + kv_h * HEAD_DIM;
+                    let w = scores[j];
+                    for d in 0..HEAD_DIM { out_head[d] += w * cache.v[li][v_off + d]; }
+                }
             }
 
-            // Output proj: [1,3072] x [3072,3072] = [1,3072]
-            gpu_matmul_q4_persistent(engine,
-                &self.buf_a, &layer.attn_output_packed, &layer.attn_output_scales, &self.buf_c,
-                &attn_out, &mut tmp,
-                1, D_MODEL as u32, D_MODEL as u32);
+            gpu_matmul_kquant(engine, &self.buf_a, &layer.attn_output_buf, &self.buf_c,
+                layer.attn_output_type, &attn_out, &mut tmp, layer.attn_output_k, layer.attn_output_n);
 
-            // Residual
             elemwise_add(hidden, &tmp, &mut norm);
             hidden.copy_from_slice(&norm);
 
-            // === FFN ===
-            gpu_rmsnorm(engine, &self.buf_a, &layer.ffn_norm_buf, &self.buf_c,
-                hidden, &mut norm, 1, D_MODEL as u32);
+            gpu_rmsnorm(engine, &self.buf_a, &layer.ffn_norm_buf, &self.buf_c, hidden, &mut norm);
 
-            // Up: [1,3072] x [3072,16384] = [1,16384]
-            gpu_matmul_q4_persistent(engine,
-                &self.buf_a, &layer.ffn_up_packed, &layer.ffn_up_scales, &self.buf_c,
-                &norm, &mut gate_up,
-                1, D_MODEL as u32, GATE_UP_DIM as u32);
+            gpu_matmul_kquant(engine, &self.buf_a, &layer.ffn_up_buf, &self.buf_c,
+                layer.ffn_up_type, &norm, &mut gate_up, layer.ffn_up_k, layer.ffn_up_n);
 
-            // Gate * up
             let (gate, up) = gate_up.split_at_mut(FFN_DIM);
-            cpu_gelu(gate);
-            elemwise_mul(gate, up, &mut ffn_mid);
+            cpu_silu(gate);
+            for i in 0..FFN_DIM { ffn_mid[i] = gate[i] * up[i]; }
 
-            // Down: [1,8192] x [8192,3072] = [1,3072]
-            gpu_matmul_q4_persistent(engine,
-                &self.buf_a, &layer.ffn_down_packed, &layer.ffn_down_scales, &self.buf_c,
-                &ffn_mid, &mut tmp,
-                1, FFN_DIM as u32, D_MODEL as u32);
+            gpu_matmul_kquant(engine, &self.buf_a, &layer.ffn_down_buf, &self.buf_c,
+                layer.ffn_down_type, &ffn_mid, &mut tmp, layer.ffn_down_k, layer.ffn_down_n);
 
-            // Residual
             elemwise_add(hidden, &tmp, &mut norm);
             hidden.copy_from_slice(&norm);
 
@@ -581,26 +423,21 @@ impl Phi4Model {
             }
         }
 
-        // Final norm + logits
+        cache.len += 1;
         rms_norm(hidden, &self.output_norm, &mut norm);
 
         let lt = Instant::now();
-        // GPU logits using pre-loaded Q4 embedding chunks — no per-token upload
-        // Each chunk: [1, D_MODEL] @ [D_MODEL, chunk_n] via matmul_q4 shader
         let mut logits = vec![0.0f32; VOCAB_SIZE];
         let mut vocab_offset = 0usize;
-        for (packed_buf, scales_buf, chunk_n) in &self.emb_packed_bufs {
+        for (emb_buf, chunk_n) in &self.emb_bufs {
             let n = *chunk_n;
             let mut chunk_out = vec![0.0f32; n];
-            gpu_matmul_q4_persistent(engine,
-                &self.buf_a, packed_buf, scales_buf, &self.logits_buf,
-                &norm, &mut chunk_out,
-                1, D_MODEL as u32, n as u32);
+            gpu_matmul_f32(engine, &self.buf_a, emb_buf, &self.logits_buf,
+                &norm, &mut chunk_out, 1, D_MODEL as u32, n as u32);
             logits[vocab_offset..vocab_offset + n].copy_from_slice(&chunk_out);
             vocab_offset += n;
         }
-        eprintln!("[fwd] logits (Q4 persistent): {}ms", lt.elapsed().as_millis());
-
+        eprintln!("[fwd] logits: {}ms", lt.elapsed().as_millis());
         logits
     }
 
@@ -610,32 +447,46 @@ impl Phi4Model {
     }
 
     pub unsafe fn generate(
-        &self,
-        engine: &ComputeEngine,
-        prompt: &[u32],
-        n_tokens: usize,
+        &self, engine: &ComputeEngine, prompt: &[u32], n_tokens: usize, vocab: Option<&[String]>,
     ) {
-        println!("\n=== Phi-4 Mini Token Generation (Q4 weights) ===");
-        println!("Prompt: {:?} | Generating {} tokens\n", prompt, n_tokens);
-
+        println!("\n=== Phi-4 Mini (Native K-Quant, RoPE + KV Cache) ===");
+        let mut cache = KVCache::new();
         let mut tokens = prompt.to_vec();
 
-        for step in 0..n_tokens {
-            let t0 = Instant::now();
-            let mut hidden = self.embed(*tokens.last().unwrap());
-            let logits = self.forward(engine, &mut hidden);
-
-            // Argmax
-            let (best_tok, best_score) = logits.iter().enumerate()
-                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
-                .map(|(i, &s)| (i as u32, s)).unwrap();
-
-            tokens.push(best_tok);
-            println!("  [{}] token {} (logit {:.2}) — {:.1}s",
-                step, best_tok, best_score, t0.elapsed().as_secs_f32());
+        let pt = Instant::now();
+        for (i, &tok) in prompt.iter().enumerate() {
+            let mut hidden = self.embed(tok);
+            if i < prompt.len() - 1 {
+                let _ = self.forward(engine, &mut hidden, &mut cache);
+                eprintln!("[prefill] pos {}", i);
+            } else {
+                let logits = self.forward(engine, &mut hidden, &mut cache);
+                let mut idx: Vec<(usize, f32)> = logits.iter().enumerate().map(|(i,&s)|(i,s)).collect();
+                idx.sort_by(|a,b| b.1.partial_cmp(&a.1).unwrap());
+                println!("[top-5]");
+                for r in 0..5 {
+                    let s = vocab.map(|v| v.get(idx[r].0).map(|s| s.as_str()).unwrap_or("?")).unwrap_or("?");
+                    println!("  #{}: {} \"{}\" = {:.2}", r+1, idx[r].0, s, idx[r].1);
+                }
+                tokens.push(idx[0].0 as u32);
+                println!("[prefill {:.2}s]", pt.elapsed().as_secs_f32());
+            }
         }
 
-        println!("\nSequence: {:?}", tokens);
-        println!("=== Done ===");
+        for step in 0..n_tokens - 1 {
+            let t0 = Instant::now();
+            let mut hidden = self.embed(*tokens.last().unwrap());
+            let logits = self.forward(engine, &mut hidden, &mut cache);
+            let (bt, _) = logits.iter().enumerate().max_by(|a,b| a.1.partial_cmp(b.1).unwrap()).unwrap();
+            tokens.push(bt as u32);
+            let s = vocab.map(|v| v.get(bt).map(|s| s.as_str()).unwrap_or("?")).unwrap_or("?");
+            println!("  [{}] \"{}\" ({:.1} tok/s)", step+1, s, 1.0/t0.elapsed().as_secs_f32());
+        }
+
+        if let Some(v) = vocab {
+            let out: String = tokens[prompt.len()..].iter().filter_map(|&id| v.get(id as usize)).cloned().collect();
+            println!("\n--- Output ---\n{}", out);
+        }
+        println!("=== Done ({} tokens) ===", tokens.len());
     }
 }
