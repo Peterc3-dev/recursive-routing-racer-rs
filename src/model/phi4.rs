@@ -22,23 +22,27 @@ const ROPE_THETA: f32 = 10000.0;
 
 /// Quant type determines which shader + block size to use
 #[derive(Clone, Copy)]
-enum QType { Q4K, Q5K, Q6K, GPUQ4 }
+enum QType { Q4K, Q5K, Q6K, GPUQ4, GPUQ5, GPUQ6 }
 
 impl QType {
     fn shader_name(&self) -> &str {
         match self {
-            QType::Q4K => "matmul_q4k", QType::Q5K => "matmul_q5k",
-            QType::Q6K => "matmul_q6k", QType::GPUQ4 => "matmul_gpuq4",
+            QType::Q4K => "matmul_q4k", QType::Q5K => "matmul_q5k", QType::Q6K => "matmul_q6k",
+            QType::GPUQ4 => "matmul_gpuq4", QType::GPUQ5 => "matmul_gpuq5", QType::GPUQ6 => "matmul_gpuq6",
         }
     }
     fn fused_shader_name(&self) -> &str {
         match self {
             QType::Q4K | QType::GPUQ4 => "fused_norm_matmul_q4k",
-            QType::Q5K => "fused_norm_matmul_q5k", QType::Q6K => "fused_norm_matmul_q6k",
+            QType::Q5K | QType::GPUQ5 => "fused_norm_matmul_q5k",
+            QType::Q6K | QType::GPUQ6 => "fused_norm_matmul_q6k",
         }
     }
     fn block_bytes(&self) -> usize {
-        match self { QType::Q4K => 144, QType::Q5K => 176, QType::Q6K => 210, QType::GPUQ4 => 192 }
+        match self {
+            QType::Q4K => 144, QType::Q5K => 176, QType::Q6K => 210,
+            QType::GPUQ4 => 192, QType::GPUQ5 | QType::GPUQ6 => 320,
+        }
     }
     fn workgroups(&self, n: u32) -> u32 { n }
     fn from_gguf(typ: u32) -> Self {
@@ -195,6 +199,114 @@ fn repack_q4k(raw: &[u8], n_elements: usize) -> Vec<u8> {
             let mut word = u32::from_le_bytes([ob[off], ob[off + 1], ob[off + 2], ob[off + 3]]);
             word |= (nibble as u32) << bit_pos;
             ob[off..off + 4].copy_from_slice(&word.to_le_bytes());
+        }
+    }
+    out
+}
+
+// ============================================================================
+// GPU-native Q5_K repacker
+// ============================================================================
+
+/// Repack Q5_K blocks into GPU-friendly layout.
+/// Input: raw Q5_K bytes (176 bytes per 256 elements)
+/// Output: 320 bytes per block: f32[8] scales + f32[8] mins + u8[256] quants (as u32[64])
+///   Quant value = 5-bit combined (low nibble | qh_bit << 4), range 0-31
+///   Element e at word[e/4] byte [e%4]
+fn repack_q5k(raw: &[u8], n_elements: usize) -> Vec<u8> {
+    let n_blocks = n_elements / 256;
+    let mut out = vec![0u8; n_blocks * 320];
+
+    for bi in 0..n_blocks {
+        let b = &raw[bi * 176..];
+        let d = f16_to_f32(u16::from_le_bytes([b[0], b[1]]));
+        let dmin = f16_to_f32(u16::from_le_bytes([b[2], b[3]]));
+        let sc_bytes = &b[4..16];
+        let qh = &b[16..48];
+        let qs = &b[48..176];
+
+        let ob = &mut out[bi * 320..];
+
+        // Pre-decode scales and mins (same 6-bit extraction as Q4_K)
+        for sub in 0..8usize {
+            let (sc_val, mn_val) = if sub < 4 {
+                (sc_bytes[sub] as u32 & 0x3F, sc_bytes[sub + 4] as u32 & 0x3F)
+            } else {
+                let i = sub - 4;
+                (
+                    (sc_bytes[8 + i] as u32 & 0x0F) | ((sc_bytes[i] as u32 >> 6) << 4),
+                    (sc_bytes[8 + i] as u32 >> 4) | ((sc_bytes[4 + i] as u32 >> 6) << 4),
+                )
+            };
+            let sc_f32 = d * sc_val as f32;
+            let mn_f32 = dmin * mn_val as f32;
+            ob[sub * 4..sub * 4 + 4].copy_from_slice(&sc_f32.to_le_bytes());
+            ob[32 + sub * 4..32 + sub * 4 + 4].copy_from_slice(&mn_f32.to_le_bytes());
+        }
+
+        // Pack combined 5-bit quants as u8 per element
+        let q_base = 64; // offset for quant data
+        for e in 0..256usize {
+            let sub = e / 32;
+            let j = e % 32;
+            let pair = sub / 2;
+            let q_byte = qs[pair * 32 + j];
+            let qi_lo = if sub % 2 == 0 { q_byte & 0x0F } else { (q_byte >> 4) & 0x0F };
+            let qh_bit = (qh[j] >> sub) & 1;
+            let qi = qi_lo | (qh_bit << 4); // 5-bit value, 0-31
+            ob[q_base + e] = qi;
+        }
+    }
+    out
+}
+
+// ============================================================================
+// GPU-native Q6_K repacker
+// ============================================================================
+
+/// Repack Q6_K blocks into GPU-friendly layout.
+/// Input: raw Q6_K bytes (210 bytes per 256 elements)
+/// Output: 320 bytes per block: f32[16] scales + u8[256] quants (as u32[64])
+///   Scale: pre-decoded d * int8_scale for each of 16 sub-blocks
+///   Quant value = 6-bit combined (ql_nibble | qh_2bits << 4), stored as u8 (0-63, add 32 at use)
+///   Element e at byte offset [64 + e]
+fn repack_q6k(raw: &[u8], n_elements: usize) -> Vec<u8> {
+    let n_blocks = n_elements / 256;
+    let mut out = vec![0u8; n_blocks * 320];
+
+    for bi in 0..n_blocks {
+        let b = &raw[bi * 210..];
+        let ql = &b[0..128];
+        let qh = &b[128..192];
+        let scales_raw = &b[192..208];
+        let d = f16_to_f32(u16::from_le_bytes([b[208], b[209]]));
+
+        let ob = &mut out[bi * 320..];
+
+        // Pre-decode 16 scales to f32: d * int8(scale)
+        for s in 0..16usize {
+            let sc_i8 = scales_raw[s] as i8;
+            let sc_f32 = d * sc_i8 as f32;
+            ob[s * 4..s * 4 + 4].copy_from_slice(&sc_f32.to_le_bytes());
+        }
+
+        // Pack combined 6-bit quants as u8 per element
+        let q_base = 64; // 16 * 4 = 64 bytes for scales
+        for e in 0..256usize {
+            let g = e / 128;
+            let pos_in_group = e % 128;
+            let quad = pos_in_group / 32;
+            let l = pos_in_group % 32;
+
+            let ql_idx = g * 64 + l + ((quad & 1) * 32);
+            let ql_byte = ql[ql_idx];
+            let ql_val = if quad < 2 { ql_byte & 0x0F } else { (ql_byte >> 4) & 0x0F };
+
+            let qh_byte = qh[g * 32 + l];
+            let qh_val = (qh_byte >> (quad * 2)) & 0x03;
+
+            let qi = ql_val | (qh_val << 4); // 6-bit unsigned, 0-63
+            ob[q_base + e] = qi;
         }
     }
     out
@@ -385,6 +497,8 @@ impl Phi4Model {
         engine.get_pipeline("fused_norm_matmul_q5k", 4, 8);
         engine.get_pipeline("fused_norm_matmul_q6k", 4, 8);
         engine.get_pipeline("matmul_gpuq4", 3, 8);
+        engine.get_pipeline("matmul_gpuq5", 3, 8);
+        engine.get_pipeline("matmul_gpuq6", 3, 8);
         engine.get_pipeline("rope", 2, 20);          // 5 push u32s = 20 bytes
         engine.get_pipeline("silu_gate", 2, 4);      // 1 push u32
         engine.get_pipeline("residual_add", 3, 4);   // 1 push u32
@@ -404,12 +518,12 @@ impl Phi4Model {
                 let ne1 = info.shape[1] as u32;
                 let raw_bytes = gguf.tensor_bytes(name);
 
-                let (data, qtype) = if matches!(gguf_qtype, QType::Q4K) {
-                    let n_elements = ne0 as usize * ne1 as usize;
-                    let repacked = repack_q4k(raw_bytes, n_elements);
-                    (repacked, QType::GPUQ4)
-                } else {
-                    (raw_bytes.to_vec(), gguf_qtype)
+                let n_elements = ne0 as usize * ne1 as usize;
+                let (data, qtype) = match gguf_qtype {
+                    QType::Q4K => (repack_q4k(raw_bytes, n_elements), QType::GPUQ4),
+                    QType::Q5K => (repack_q5k(raw_bytes, n_elements), QType::GPUQ5),
+                    QType::Q6K => (repack_q6k(raw_bytes, n_elements), QType::GPUQ6),
+                    _ => (raw_bytes.to_vec(), gguf_qtype),
                 };
 
                 let buf = engine.alloc_buffer(data.len() as u64);
