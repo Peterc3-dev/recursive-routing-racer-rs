@@ -49,8 +49,10 @@ pub struct Phi4Model {
     // Shared GPU buffers (reused per dispatch)
     pub buf_a: GpuBuffer,
     pub logits_buf: GpuBuffer,
-    pub emb_chunk_buf: GpuBuffer,          // activation input (float32)
     pub buf_c: GpuBuffer,          // output (float32)
+    // Q4-packed embedding chunks on GPU — persistent, uploaded once at load time
+    // Each entry: (packed_buf, scales_buf, chunk_n) for a [D_MODEL, chunk_n] slice
+    pub emb_packed_bufs: Vec<(GpuBuffer, GpuBuffer, usize)>,
 }
 
 // ============================================================================
@@ -437,8 +439,44 @@ impl Phi4Model {
             t0.elapsed().as_secs_f32(), N_LAYERS, D_MODEL);
 
         let logits_buf = engine.alloc_buffer(8192 * 4);
-        let emb_chunk_buf = engine.alloc_buffer((D_MODEL * 8192) as u64 * 4);
-        Phi4Model { embedding, output_norm, layers, buf_a, buf_c, logits_buf, emb_chunk_buf }
+
+        // Q4 pack the embedding in chunks and upload to persistent GPU buffers.
+        // Embedding is [VOCAB_SIZE, D_MODEL] row-major. For logits we need
+        // [1, D_MODEL] @ [D_MODEL, chunk_n], so we transpose into [D_MODEL, chunk_n]
+        // chunks and Q4-pack each one.
+        let chunk_size: usize = 8192;
+        let mut emb_packed_bufs = Vec::new();
+        let et0 = Instant::now();
+        let mut chunk_start = 0usize;
+        while chunk_start < VOCAB_SIZE {
+            let chunk_end = (chunk_start + chunk_size).min(VOCAB_SIZE);
+            let n = chunk_end - chunk_start;
+
+            // Transpose [vocab_chunk, D_MODEL] -> [D_MODEL, n]
+            let mut transposed = vec![0.0f32; D_MODEL * n];
+            for d in 0..D_MODEL {
+                for v in 0..n {
+                    transposed[d * n + v] = embedding[(chunk_start + v) * D_MODEL + d];
+                }
+            }
+
+            let (packed, scales) = quantize_to_q4(&transposed, D_MODEL, n);
+            drop(transposed);
+
+            let packed_buf = engine.alloc_buffer(packed.len() as u64 * 4);
+            upload_u32(&packed_buf, &packed);
+            let scales_buf = engine.alloc_buffer(scales.len() as u64 * 4);
+            upload(&scales_buf, &scales);
+
+            emb_packed_bufs.push((packed_buf, scales_buf, n));
+            chunk_start = chunk_end;
+        }
+        let emb_gpu_bytes: u64 = emb_packed_bufs.iter().map(|(p, s, _)| p.capacity + s.capacity).sum();
+        eprintln!("[phi4] Embedding Q4 packed: {} chunks, {:.1}MB GPU, {:.1}s",
+            emb_packed_bufs.len(), emb_gpu_bytes as f64 / 1024.0 / 1024.0,
+            et0.elapsed().as_secs_f32());
+
+        Phi4Model { embedding, output_norm, layers, buf_a, buf_c, logits_buf, emb_packed_bufs }
     }
 
     pub unsafe fn forward(&self, engine: &ComputeEngine, hidden: &mut Vec<f32>) -> Vec<f32> {
@@ -513,42 +551,21 @@ impl Phi4Model {
         rms_norm(hidden, &self.output_norm, &mut norm);
 
         let lt = Instant::now();
-        // GPU logits: chunk embedding into GPU-sized matmuls
-        // [1, 3072] @ [3072, chunk] for each chunk of vocab
-        let chunk_size: usize = 8192; // fits in GPU memory
+        // GPU logits using pre-loaded Q4 embedding chunks — no per-token upload
+        // Each chunk: [1, D_MODEL] @ [D_MODEL, chunk_n] via matmul_q4 shader
         let mut logits = vec![0.0f32; VOCAB_SIZE];
-        let logits_buf = &self.logits_buf;
-        let emb_chunk_buf = &self.emb_chunk_buf;
-        
-        for start in (0..VOCAB_SIZE).step_by(chunk_size) {
-            let end = (start + chunk_size).min(VOCAB_SIZE);
-            let n = end - start;
-            
-            // Upload embedding chunk as weight matrix [D_MODEL, n] (transposed view)
-            // The embedding is stored as [vocab, D_MODEL] row-major
-            // We need [D_MODEL, n] for matmul, so transpose on upload
-            let chunk_data: Vec<f32> = (0..D_MODEL).flat_map(|d| {
-                (start..end).map(move |v| self.embedding[v * D_MODEL + d])
-            }).collect();
-            upload(&emb_chunk_buf, &chunk_data);
-            
-            // Dispatch: [1, 3072] @ [3072, n] = [1, n]
-            upload(&self.buf_a, &norm);
-            let push: [u32; 3] = [1, D_MODEL as u32, n as u32];
-            let pb: Vec<u8> = push.iter().flat_map(|v| v.to_le_bytes()).collect();
-            engine.dispatch_by_name(
-                "matmul_tiled",
-                &[&self.buf_a, emb_chunk_buf, logits_buf],
-                &[(D_MODEL as u64) * 4, (D_MODEL * n) as u64 * 4, (n as u64) * 4],
-                &pb,
-                [((n as u32) + 15) / 16, 1, 1],
-            );
-            
+        let mut vocab_offset = 0usize;
+        for (packed_buf, scales_buf, chunk_n) in &self.emb_packed_bufs {
+            let n = *chunk_n;
             let mut chunk_out = vec![0.0f32; n];
-            download(&logits_buf, &mut chunk_out);
-            logits[start..end].copy_from_slice(&chunk_out);
+            gpu_matmul_q4_persistent(engine,
+                &self.buf_a, packed_buf, scales_buf, &self.logits_buf,
+                &norm, &mut chunk_out,
+                1, D_MODEL as u32, n as u32);
+            logits[vocab_offset..vocab_offset + n].copy_from_slice(&chunk_out);
+            vocab_offset += n;
         }
-        eprintln!("[fwd] logits (GPU chunked): {}ms", lt.elapsed().as_millis());
+        eprintln!("[fwd] logits (Q4 persistent): {}ms", lt.elapsed().as_millis());
 
         logits
     }
