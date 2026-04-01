@@ -22,17 +22,23 @@ const ROPE_THETA: f32 = 10000.0;
 
 /// Quant type determines which shader + block size to use
 #[derive(Clone, Copy)]
-enum QType { Q4K, Q5K, Q6K }
+enum QType { Q4K, Q5K, Q6K, GPUQ4 }
 
 impl QType {
     fn shader_name(&self) -> &str {
-        match self { QType::Q4K => "matmul_q4k", QType::Q5K => "matmul_q5k", QType::Q6K => "matmul_q6k" }
+        match self {
+            QType::Q4K => "matmul_q4k", QType::Q5K => "matmul_q5k",
+            QType::Q6K => "matmul_q6k", QType::GPUQ4 => "matmul_gpuq4",
+        }
     }
     fn fused_shader_name(&self) -> &str {
-        match self { QType::Q4K => "fused_norm_matmul_q4k", QType::Q5K => "fused_norm_matmul_q5k", QType::Q6K => "fused_norm_matmul_q6k" }
+        match self {
+            QType::Q4K | QType::GPUQ4 => "fused_norm_matmul_q4k",
+            QType::Q5K => "fused_norm_matmul_q5k", QType::Q6K => "fused_norm_matmul_q6k",
+        }
     }
     fn block_bytes(&self) -> usize {
-        match self { QType::Q4K => 144, QType::Q5K => 176, QType::Q6K => 210 }
+        match self { QType::Q4K => 144, QType::Q5K => 176, QType::Q6K => 210, QType::GPUQ4 => 192 }
     }
     fn workgroups(&self, n: u32) -> u32 { n }
     fn from_gguf(typ: u32) -> Self {
@@ -131,6 +137,67 @@ fn apply_rope(x: &mut [f32], pos: usize, n_heads: usize, rope_factors: &[f32]) {
             x[base + 2 * i + 1] = x0 * sin_scaled + x1 * cos_scaled;
         }
     }
+}
+
+// ============================================================================
+// GPU-native Q4_K repacker
+// ============================================================================
+
+/// Repack Q4_K blocks into GPU-friendly layout.
+/// Input: raw Q4_K bytes (144 bytes per 256 elements, N rows × K/256 blocks per row)
+/// Output: repacked bytes (192 bytes per 256 elements)
+///   Per block: f32[8] scales + f32[8] mins + u32[32] nibbles
+///   Element e → nibble at word[e/8] bits [(e%8)*4 +: 4]
+fn repack_q4k(raw: &[u8], n_elements: usize) -> Vec<u8> {
+    let n_blocks = n_elements / 256;
+    let mut out = vec![0u8; n_blocks * 192];
+
+    for bi in 0..n_blocks {
+        let b = &raw[bi * 144..];
+        let d = f16_to_f32(u16::from_le_bytes([b[0], b[1]]));
+        let dmin = f16_to_f32(u16::from_le_bytes([b[2], b[3]]));
+        let sc_bytes = &b[4..16];
+        let qs = &b[16..144];
+
+        let ob = &mut out[bi * 192..];
+
+        // Pre-decode scales and mins to f32
+        for sub in 0..8usize {
+            let (sc_val, mn_val) = if sub < 4 {
+                (sc_bytes[sub] as u32 & 0x3F, sc_bytes[sub + 4] as u32 & 0x3F)
+            } else {
+                let i = sub - 4;
+                (
+                    (sc_bytes[8 + i] as u32 & 0x0F) | ((sc_bytes[i] as u32 >> 6) << 4),
+                    (sc_bytes[8 + i] as u32 >> 4) | ((sc_bytes[4 + i] as u32 >> 6) << 4),
+                )
+            };
+            let sc_f32 = d * sc_val as f32;
+            let mn_f32 = dmin * mn_val as f32;
+            ob[sub * 4..sub * 4 + 4].copy_from_slice(&sc_f32.to_le_bytes());
+            ob[32 + sub * 4..32 + sub * 4 + 4].copy_from_slice(&mn_f32.to_le_bytes());
+        }
+
+        // Repack nibbles: element e → word[e/8] bits [(e%8)*4 +: 4]
+        // Q4_K layout: sub-block s (0..7), position j (0..31)
+        // qs byte at pair*32+j contains low nibble (sub even) and high nibble (sub odd)
+        let nibble_base = 64; // offset in output block for nibble data
+        for e in 0..256usize {
+            let sub = e / 32;
+            let j = e % 32;
+            let pair = sub / 2;
+            let q_byte = qs[pair * 32 + j];
+            let nibble = if sub % 2 == 0 { q_byte & 0x0F } else { (q_byte >> 4) & 0x0F };
+
+            let word_idx = e / 8;
+            let bit_pos = (e % 8) * 4;
+            let off = nibble_base + word_idx * 4;
+            let mut word = u32::from_le_bytes([ob[off], ob[off + 1], ob[off + 2], ob[off + 3]]);
+            word |= (nibble as u32) << bit_pos;
+            ob[off..off + 4].copy_from_slice(&word.to_le_bytes());
+        }
+    }
+    out
 }
 
 // ============================================================================
@@ -317,6 +384,7 @@ impl Phi4Model {
         engine.get_pipeline("fused_norm_matmul_q4k", 4, 8);
         engine.get_pipeline("fused_norm_matmul_q5k", 4, 8);
         engine.get_pipeline("fused_norm_matmul_q6k", 4, 8);
+        engine.get_pipeline("matmul_gpuq4", 3, 8);
         engine.get_pipeline("rope", 2, 20);          // 5 push u32s = 20 bytes
         engine.get_pipeline("silu_gate", 2, 4);      // 1 push u32
         engine.get_pipeline("residual_add", 3, 4);   // 1 push u32
@@ -328,16 +396,25 @@ impl Phi4Model {
         for i in 0..N_LAYERS {
             let prefix = format!("blk.{}", i);
 
-            // Upload raw GGUF bytes to GPU — NO dequant, NO transpose, NO requant
+            // Upload weights to GPU — repack Q4_K to GPU-native format
             let mut load_weight = |name: &str| -> (GpuBuffer, QType, u32, u32) {
                 let info = gguf.tensor_infos.iter().find(|t| t.name == name).unwrap();
-                let qtype = QType::from_gguf(info.typ);
-                let ne0 = info.shape[0] as u32;  // K (input dim, fast)
-                let ne1 = info.shape[1] as u32;  // N (output dim)
+                let gguf_qtype = QType::from_gguf(info.typ);
+                let ne0 = info.shape[0] as u32;
+                let ne1 = info.shape[1] as u32;
                 let raw_bytes = gguf.tensor_bytes(name);
-                let buf = engine.alloc_buffer(raw_bytes.len() as u64);
-                upload_bytes(&buf, raw_bytes);
-                total_gpu += raw_bytes.len() as u64;
+
+                let (data, qtype) = if matches!(gguf_qtype, QType::Q4K) {
+                    let n_elements = ne0 as usize * ne1 as usize;
+                    let repacked = repack_q4k(raw_bytes, n_elements);
+                    (repacked, QType::GPUQ4)
+                } else {
+                    (raw_bytes.to_vec(), gguf_qtype)
+                };
+
+                let buf = engine.alloc_buffer(data.len() as u64);
+                upload_bytes(&buf, &data);
+                total_gpu += data.len() as u64;
                 (buf, qtype, ne0, ne1)
             };
 
