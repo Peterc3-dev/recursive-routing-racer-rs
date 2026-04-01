@@ -1,0 +1,16 @@
+[package]
+name = "rrr"
+version = "0.1.0"
+edition = "2024"
+description = "Recursive Routing Racer — tri-processor inference runtime"
+
+[dependencies]
+ash = { version = "0.38", features = ["linked"] }
+ash-window = "0.13"
+memmap2 = "0.9"
+half = { version = "2.4", features = ["std"] }
+rayon = "1.10"
+
+[profile.release]
+opt-level = 3
+lto = true
