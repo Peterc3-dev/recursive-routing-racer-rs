@@ -508,95 +508,71 @@ impl Phi4Model {
         let resid_wg = ((d + 255) / 256) as u32;
         let kv_bytes = seq_len as u64 * kv_stride as u64 * 4;
 
+        // Build ALL dispatches for ALL 32 layers into one mega-batch
+        let mut all_names: Vec<String> = Vec::with_capacity(12 * N_LAYERS);
+        let mut all_bufs: Vec<Vec<&GpuBuffer>> = Vec::with_capacity(12 * N_LAYERS);
+        let mut all_sizes: Vec<Vec<u64>> = Vec::with_capacity(12 * N_LAYERS);
+        let mut all_push: Vec<Vec<u8>> = Vec::with_capacity(12 * N_LAYERS);
+        let mut all_groups: Vec<[u32; 3]> = Vec::with_capacity(12 * N_LAYERS);
+
+        macro_rules! add {
+            ($name:expr, $bufs:expr, $sizes:expr, $push:expr, $groups:expr) => {
+                all_names.push($name.to_string());
+                all_bufs.push($bufs);
+                all_sizes.push($sizes);
+                all_push.push($push);
+                all_groups.push($groups);
+            }
+        }
+
         for (_li, layer) in self.layers.iter().enumerate() {
             let (ref kbuf, ref vbuf) = self.kv_bufs[_li];
-
-            let qkv_push: Vec<u8> = [layer.attn_qkv_k, layer.attn_qkv_n]
-                .iter().flat_map(|v| v.to_le_bytes()).collect();
             let bpr_qkv = layer.attn_qkv_k as u64 / 256;
             let wb_qkv = layer.attn_qkv_n as u64 * bpr_qkv * layer.attn_qkv_type.block_bytes() as u64;
-
-            let out_push: Vec<u8> = [layer.attn_output_k, layer.attn_output_n]
-                .iter().flat_map(|v| v.to_le_bytes()).collect();
             let bpr_out = layer.attn_output_k as u64 / 256;
             let wb_out = layer.attn_output_n as u64 * bpr_out * layer.attn_output_type.block_bytes() as u64;
-
-            let up_push: Vec<u8> = [layer.ffn_up_k, layer.ffn_up_n]
-                .iter().flat_map(|v| v.to_le_bytes()).collect();
             let bpr_up = layer.ffn_up_k as u64 / 256;
             let wb_up = layer.ffn_up_n as u64 * bpr_up * layer.ffn_up_type.block_bytes() as u64;
-
-            let dn_push: Vec<u8> = [layer.ffn_down_k, layer.ffn_down_n]
-                .iter().flat_map(|v| v.to_le_bytes()).collect();
             let bpr_dn = layer.ffn_down_k as u64 / 256;
             let wb_dn = layer.ffn_down_n as u64 * bpr_dn * layer.ffn_down_type.block_bytes() as u64;
+            let pb2 = |a: u32, b: u32| -> Vec<u8> { [a, b].iter().flat_map(|v| v.to_le_bytes()).collect() };
 
-            // Build all buffer/size vecs for the 11 dispatches
-            let b_norm1: Vec<&GpuBuffer> = vec![&self.gpu_hidden, &layer.attn_norm_buf, &self.gpu_normed];
-            let s_norm1: Vec<u64> = vec![d as u64*4, d as u64*4, d as u64*4];
-
-            let b_qkv: Vec<&GpuBuffer> = vec![&self.gpu_normed, &layer.attn_qkv_buf, &self.gpu_qkv];
-            let s_qkv: Vec<u64> = vec![layer.attn_qkv_k as u64*4, wb_qkv, layer.attn_qkv_n as u64*4];
-
-            let b_rope: Vec<&GpuBuffer> = vec![&self.gpu_qkv, &self.gpu_rope_factors];
-            let s_rope: Vec<u64> = vec![QKV_DIM as u64*4, (ROPE_DIM as u64/2)*4];
-
-            let b_kvs: Vec<&GpuBuffer> = vec![&self.gpu_qkv, kbuf, vbuf];
-            let s_kvs: Vec<u64> = vec![QKV_DIM as u64*4, kv_bytes, kv_bytes];
-
-            // Attention reads Q from gpu_qkv[0..N_HEADS*HEAD_DIM]
-            let b_attn: Vec<&GpuBuffer> = vec![&self.gpu_qkv, kbuf, vbuf, &self.attn_out_buf];
-            let s_attn: Vec<u64> = vec![D_MODEL as u64*4, kv_bytes, kv_bytes, D_MODEL as u64*4];
-
-            let b_out: Vec<&GpuBuffer> = vec![&self.attn_out_buf, &layer.attn_output_buf, &self.gpu_tmp];
-            let s_out: Vec<u64> = vec![layer.attn_output_k as u64*4, wb_out, layer.attn_output_n as u64*4];
-
-            let b_res1: Vec<&GpuBuffer> = vec![&self.gpu_hidden, &self.gpu_tmp, &self.gpu_hidden];
-            let s_res1: Vec<u64> = vec![d as u64*4, d as u64*4, d as u64*4];
-
-            let b_norm2: Vec<&GpuBuffer> = vec![&self.gpu_hidden, &layer.ffn_norm_buf, &self.gpu_normed];
-            let s_norm2: Vec<u64> = vec![d as u64*4, d as u64*4, d as u64*4];
-
-            let b_up: Vec<&GpuBuffer> = vec![&self.gpu_normed, &layer.ffn_up_buf, &self.gpu_gate_up];
-            let s_up: Vec<u64> = vec![layer.ffn_up_k as u64*4, wb_up, layer.ffn_up_n as u64*4];
-
-            let b_silu: Vec<&GpuBuffer> = vec![&self.gpu_gate_up, &self.gpu_ffn_mid];
-            let s_silu: Vec<u64> = vec![GATE_UP_DIM as u64*4, FFN_DIM as u64*4];
-
-            let b_dn: Vec<&GpuBuffer> = vec![&self.gpu_ffn_mid, &layer.ffn_down_buf, &self.gpu_tmp];
-            let s_dn: Vec<u64> = vec![layer.ffn_down_k as u64*4, wb_dn, layer.ffn_down_n as u64*4];
-
-            let b_res2: Vec<&GpuBuffer> = vec![&self.gpu_hidden, &self.gpu_tmp, &self.gpu_hidden];
-            let s_res2: Vec<u64> = vec![d as u64*4, d as u64*4, d as u64*4];
-
-            // 11 dispatches, ONE submit
-            engine.dispatch_batch(&[
-                // 1. RMS norm (attn)
-                ("rmsnorm", &b_norm1, &s_norm1, &norm_push, [1, 1, 1]),
-                // 2. QKV matmul
-                (layer.attn_qkv_type.shader_name(), &b_qkv, &s_qkv, &qkv_push, [layer.attn_qkv_type.workgroups(layer.attn_qkv_n), 1, 1]),
-                // 3. RoPE (in-place on qkv)
-                ("rope", &b_rope, &s_rope, &rope_push, [rope_wg, 1, 1]),
-                // 4. KV store (copy K,V from qkv to cache)
-                ("kv_store", &b_kvs, &s_kvs, &kv_store_push, [kv_store_wg, 1, 1]),
-                // 5. Attention
-                ("attention", &b_attn, &s_attn, &attn_push, [N_HEADS as u32, 1, 1]),
-                // 6. Output projection
-                (layer.attn_output_type.shader_name(), &b_out, &s_out, &out_push, [layer.attn_output_type.workgroups(layer.attn_output_n), 1, 1]),
-                // 7. Residual add (hidden += output_proj)
-                ("residual_add", &b_res1, &s_res1, &resid_push, [resid_wg, 1, 1]),
-                // 8. RMS norm (FFN)
-                ("rmsnorm", &b_norm2, &s_norm2, &norm_push, [1, 1, 1]),
-                // 9. FFN up
-                (layer.ffn_up_type.shader_name(), &b_up, &s_up, &up_push, [layer.ffn_up_type.workgroups(layer.ffn_up_n), 1, 1]),
-                // 10. SiLU gate
-                ("silu_gate", &b_silu, &s_silu, &silu_push, [silu_wg, 1, 1]),
-                // 11. FFN down
-                (layer.ffn_down_type.shader_name(), &b_dn, &s_dn, &dn_push, [layer.ffn_down_type.workgroups(layer.ffn_down_n), 1, 1]),
-                // 12. Residual add (hidden += ffn_down)
-                ("residual_add", &b_res2, &s_res2, &resid_push, [resid_wg, 1, 1]),
-            ]);
+            add!("rmsnorm", vec![&self.gpu_hidden, &layer.attn_norm_buf, &self.gpu_normed],
+                vec![d as u64*4; 3], norm_push.clone(), [1,1,1]);
+            add!(layer.attn_qkv_type.shader_name(), vec![&self.gpu_normed, &layer.attn_qkv_buf, &self.gpu_qkv],
+                vec![layer.attn_qkv_k as u64*4, wb_qkv, layer.attn_qkv_n as u64*4], pb2(layer.attn_qkv_k, layer.attn_qkv_n),
+                [layer.attn_qkv_type.workgroups(layer.attn_qkv_n), 1, 1]);
+            add!("rope", vec![&self.gpu_qkv, &self.gpu_rope_factors],
+                vec![QKV_DIM as u64*4, (ROPE_DIM as u64/2)*4], rope_push.clone(), [rope_wg,1,1]);
+            add!("kv_store", vec![&self.gpu_qkv, kbuf, vbuf],
+                vec![QKV_DIM as u64*4, kv_bytes, kv_bytes], kv_store_push.clone(), [kv_store_wg,1,1]);
+            add!("attention", vec![&self.gpu_qkv, kbuf, vbuf, &self.attn_out_buf],
+                vec![D_MODEL as u64*4, kv_bytes, kv_bytes, D_MODEL as u64*4], attn_push.clone(), [N_HEADS as u32,1,1]);
+            add!(layer.attn_output_type.shader_name(), vec![&self.attn_out_buf, &layer.attn_output_buf, &self.gpu_tmp],
+                vec![layer.attn_output_k as u64*4, wb_out, layer.attn_output_n as u64*4], pb2(layer.attn_output_k, layer.attn_output_n),
+                [layer.attn_output_type.workgroups(layer.attn_output_n), 1, 1]);
+            add!("residual_add", vec![&self.gpu_hidden, &self.gpu_tmp, &self.gpu_hidden],
+                vec![d as u64*4; 3], resid_push.clone(), [resid_wg,1,1]);
+            add!("rmsnorm", vec![&self.gpu_hidden, &layer.ffn_norm_buf, &self.gpu_normed],
+                vec![d as u64*4; 3], norm_push.clone(), [1,1,1]);
+            add!(layer.ffn_up_type.shader_name(), vec![&self.gpu_normed, &layer.ffn_up_buf, &self.gpu_gate_up],
+                vec![layer.ffn_up_k as u64*4, wb_up, layer.ffn_up_n as u64*4], pb2(layer.ffn_up_k, layer.ffn_up_n),
+                [layer.ffn_up_type.workgroups(layer.ffn_up_n), 1, 1]);
+            add!("silu_gate", vec![&self.gpu_gate_up, &self.gpu_ffn_mid],
+                vec![GATE_UP_DIM as u64*4, FFN_DIM as u64*4], silu_push.clone(), [silu_wg,1,1]);
+            add!(layer.ffn_down_type.shader_name(), vec![&self.gpu_ffn_mid, &layer.ffn_down_buf, &self.gpu_tmp],
+                vec![layer.ffn_down_k as u64*4, wb_dn, layer.ffn_down_n as u64*4], pb2(layer.ffn_down_k, layer.ffn_down_n),
+                [layer.ffn_down_type.workgroups(layer.ffn_down_n), 1, 1]);
+            add!("residual_add", vec![&self.gpu_hidden, &self.gpu_tmp, &self.gpu_hidden],
+                vec![d as u64*4; 3], resid_push.clone(), [resid_wg,1,1]);
         }
+
+        // ALL 384 dispatches in ONE command buffer submit
+        let dispatch_refs: Vec<(&str, &[&GpuBuffer], &[u64], &[u8], [u32; 3])> = (0..all_names.len())
+            .map(|i| (all_names[i].as_str(), all_bufs[i].as_slice(), all_sizes[i].as_slice(),
+                      all_push[i].as_slice(), all_groups[i]))
+            .collect();
+        engine.dispatch_batch(&dispatch_refs);
 
         cache.len += 1;
 

@@ -99,10 +99,10 @@ impl ComputeEngine {
         // Descriptor pool
         let pool_size = vk::DescriptorPoolSize {
             ty: vk::DescriptorType::STORAGE_BUFFER,
-            descriptor_count: 2048,
+            descriptor_count: 8192,
         };
         let dp_info = vk::DescriptorPoolCreateInfo::default()
-            .max_sets(512)
+            .max_sets(1024)
             .pool_sizes(std::slice::from_ref(&pool_size))
             .flags(vk::DescriptorPoolCreateFlags::FREE_DESCRIPTOR_SET);
         let desc_pool = device.create_descriptor_pool(&dp_info, None).unwrap();
