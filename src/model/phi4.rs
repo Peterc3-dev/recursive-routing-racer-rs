@@ -587,7 +587,7 @@ impl Phi4Model {
         // GPU attention buffers
         let attn_q_buf = engine.alloc_buffer((D_MODEL as u64) * 4);
         let attn_out_buf = engine.alloc_buffer((D_MODEL as u64) * 4);
-        let kv_size = (MAX_SEQ * N_KV_HEADS * HEAD_DIM) as u64 * 4;
+        let kv_size = (MAX_SEQ * N_KV_HEADS * HEAD_DIM) as u64 * 2;  // f16: 2 bytes per element
         let mut kv_bufs = Vec::with_capacity(N_LAYERS);
         for _ in 0..N_LAYERS {
             let kb = engine.alloc_buffer(kv_size);
@@ -658,7 +658,7 @@ impl Phi4Model {
 
         // Pre-allocate ALL 384 descriptor sets for the mega-batch
         let d4 = D_MODEL as u64 * 4;
-        let kv_max_bytes = (MAX_SEQ * N_KV_HEADS * HEAD_DIM) as u64 * 4;
+        let kv_max_bytes = (MAX_SEQ * N_KV_HEADS * HEAD_DIM) as u64 * 2;  // f16
         let mut mega_dispatches: Vec<PrebuiltDispatch> = Vec::with_capacity(12 * N_LAYERS);
 
         for i in 0..N_LAYERS {
@@ -674,7 +674,7 @@ impl Phi4Model {
             let wb_dn = layer.ffn_down_n as u64 * bpr_dn * layer.ffn_down_type.block_bytes() as u64;
             let rope_pairs = (N_HEADS + N_KV_HEADS) * (ROPE_DIM / 2);
             let rope_wg = ((rope_pairs + 63) / 64) as u32;
-            let kv_store_wg = (((N_KV_HEADS * HEAD_DIM) as u32 + 255) / 256) as u32;
+            let kv_store_wg = (((N_KV_HEADS * HEAD_DIM / 2) as u32 + 255) / 256) as u32;  // /2: each thread packs 2 f16
             let silu_wg = ((FFN_DIM as u32 + 255) / 256) as u32;
             let resid_wg = ((D_MODEL as u32 + 255) / 256) as u32;
 
