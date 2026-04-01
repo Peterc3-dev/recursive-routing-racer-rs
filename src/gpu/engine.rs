@@ -236,10 +236,28 @@ impl ComputeEngine {
     }
 
 
-    /// Batch multiple dispatches into ONE command buffer, ONE submit, ONE fence wait.
+    /// Batch multiple dispatches into ONE command buffer with barriers between them.
+    /// Use for sequential pipeline stages (output of one feeds input of next).
     pub unsafe fn dispatch_batch(
         &self,
         dispatches: &[(&str, &[&GpuBuffer], &[u64], &[u8], [u32; 3])],
+    ) {
+        self.dispatch_batch_inner(dispatches, true);
+    }
+
+    /// Batch independent dispatches — NO barriers between them, can run in parallel.
+    /// Use when dispatches don't share output→input buffers.
+    pub unsafe fn dispatch_batch_parallel(
+        &self,
+        dispatches: &[(&str, &[&GpuBuffer], &[u64], &[u8], [u32; 3])],
+    ) {
+        self.dispatch_batch_inner(dispatches, false);
+    }
+
+    unsafe fn dispatch_batch_inner(
+        &self,
+        dispatches: &[(&str, &[&GpuBuffer], &[u64], &[u8], [u32; 3])],
+        sequential: bool,
     ) {
         let mut desc_sets = Vec::with_capacity(dispatches.len());
         for (name, bufs, sizes, _, _) in dispatches {
@@ -248,7 +266,7 @@ impl ComputeEngine {
                 .descriptor_pool(self.desc_pool)
                 .set_layouts(std::slice::from_ref(&pipeline.desc_set_layout));
             let ds = self.device.allocate_descriptor_sets(&ds_alloc).unwrap()[0];
-            
+
             let buf_infos: Vec<vk::DescriptorBufferInfo> = bufs.iter().zip(sizes.iter()).map(|(b, &s)| {
                 vk::DescriptorBufferInfo { buffer: b.buffer, offset: 0, range: s }
             }).collect();
@@ -281,15 +299,17 @@ impl ComputeEngine {
             }
             self.device.cmd_dispatch(self.cmd_buf, groups[0], groups[1], groups[2]);
 
-            let barrier = vk::MemoryBarrier::default()
-                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-                .dst_access_mask(vk::AccessFlags::SHADER_READ);
-            self.device.cmd_pipeline_barrier(
-                self.cmd_buf,
-                vk::PipelineStageFlags::COMPUTE_SHADER,
-                vk::PipelineStageFlags::COMPUTE_SHADER,
-                vk::DependencyFlags::empty(),
-                &[barrier], &[], &[]);
+            if sequential {
+                let barrier = vk::MemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::SHADER_READ);
+                self.device.cmd_pipeline_barrier(
+                    self.cmd_buf,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &[barrier], &[], &[]);
+            }
         }
 
         let host_barrier = vk::MemoryBarrier::default()

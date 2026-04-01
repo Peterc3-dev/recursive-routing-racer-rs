@@ -61,6 +61,7 @@ pub struct Phi4Model {
     pub attn_q_buf: GpuBuffer,     // [N_HEADS * HEAD_DIM]
     pub attn_out_buf: GpuBuffer,   // [N_HEADS * HEAD_DIM]
     pub kv_bufs: Vec<(GpuBuffer, GpuBuffer)>,  // per-layer (K_cache, V_cache) on GPU
+    pub logit_out_bufs: Vec<GpuBuffer>,  // per-chunk logit output buffers for batching
 }
 
 pub struct KVCache {
@@ -361,101 +362,182 @@ impl Phi4Model {
         }
         total_gpu += N_LAYERS as u64 * kv_size * 2 + D_MODEL as u64 * 4 * 2;
 
+        // Per-chunk logit output buffers for batched logits
+        let mut logit_out_bufs = Vec::with_capacity(emb_bufs.len());
+        for (_, n) in &emb_bufs {
+            let buf = engine.alloc_buffer((*n as u64) * 4);
+            logit_out_bufs.push(buf);
+        }
+
         eprintln!("[phi4] Ready: {:.1}s, {:.1}MB total GPU ({} emb chunks)",
             t0.elapsed().as_secs_f32(), total_gpu as f64 / 1e6, emb_bufs.len());
 
         Phi4Model { embedding, output_norm, layers, buf_a, buf_c, logits_buf, emb_bufs, rope_factors,
-                    attn_q_buf, attn_out_buf, kv_bufs }
+                    attn_q_buf, attn_out_buf, kv_bufs, logit_out_bufs }
+    }
+
+    /// Helper: build a K-quant matmul dispatch tuple for use with dispatch_batch.
+    fn kquant_dispatch<'a>(
+        buf_in: &'a GpuBuffer, weight_buf: &'a GpuBuffer, buf_out: &'a GpuBuffer,
+        qtype: QType, k: u32, n: u32,
+    ) -> (String, Vec<&'a GpuBuffer>, Vec<u64>, Vec<u8>, [u32; 3]) {
+        let blocks_per_row = k as u64 / 256;
+        let total_weight_bytes = n as u64 * blocks_per_row * qtype.block_bytes() as u64;
+        let push: [u32; 2] = [k, n];
+        let pb: Vec<u8> = push.iter().flat_map(|v| v.to_le_bytes()).collect();
+        (
+            qtype.shader_name().to_string(),
+            vec![buf_in, weight_buf, buf_out],
+            vec![k as u64 * 4, total_weight_bytes, n as u64 * 4],
+            pb,
+            [n, 1, 1],
+        )
     }
 
     pub unsafe fn forward(&self, engine: &ComputeEngine, hidden: &mut Vec<f32>, cache: &mut KVCache) -> Vec<f32> {
         assert_eq!(hidden.len(), D_MODEL);
         let pos = cache.len;
-        let mut norm = vec![0.0f32; D_MODEL];
         let mut qkv = vec![0.0f32; QKV_DIM];
         let mut attn_out = vec![0.0f32; D_MODEL];
         let mut gate_up = vec![0.0f32; GATE_UP_DIM];
         let mut ffn_mid = vec![0.0f32; FFN_DIM];
         let mut tmp = vec![0.0f32; D_MODEL];
         let heads_per_kv = N_HEADS / N_KV_HEADS;
-        let scale = 1.0 / (HEAD_DIM as f32).sqrt();
+        let d = D_MODEL as u32;
 
         for (li, layer) in self.layers.iter().enumerate() {
-            // Pre-attention RMS norm
-            gpu_rmsnorm(engine, &self.buf_a, &layer.attn_norm_buf, &self.buf_c, hidden, &mut norm);
+            // ---- Batch 1: rmsnorm → QKV matmul (buf_a → buf_c → buf_a) ----
+            upload(&self.buf_a, hidden);
+            let norm_push: Vec<u8> = [1u32, d].iter().flat_map(|v| v.to_le_bytes()).collect();
+            let qkv_d = Self::kquant_dispatch(
+                &self.buf_c, &layer.attn_qkv_buf, &self.buf_a,
+                layer.attn_qkv_type, layer.attn_qkv_k, layer.attn_qkv_n);
+            {
+                let bufs1: Vec<&GpuBuffer> = vec![&self.buf_a, &layer.attn_norm_buf, &self.buf_c];
+                let sizes1: Vec<u64> = vec![d as u64 * 4, d as u64 * 4, d as u64 * 4];
+                let bufs2: Vec<&GpuBuffer> = qkv_d.1;
+                let sizes2: Vec<u64> = qkv_d.2;
+                engine.dispatch_batch(&[
+                    ("rmsnorm", &bufs1, &sizes1, &norm_push, [1, 1, 1]),
+                    (qkv_d.0.as_str(), &bufs2, &sizes2, &qkv_d.3, qkv_d.4),
+                ]);
+            }
+            download(&self.buf_a, &mut qkv[..QKV_DIM]);
 
-            // QKV via native K-quant shader
-            gpu_matmul_kquant(engine, &self.buf_a, &layer.attn_qkv_buf, &self.buf_c,
-                layer.attn_qkv_type, &norm, &mut qkv, layer.attn_qkv_k, layer.attn_qkv_n);
-
+            // CPU: split QKV, RoPE, update KV cache
             let q_end = N_HEADS * HEAD_DIM;
             let k_end = q_end + N_KV_HEADS * HEAD_DIM;
             let mut q = qkv[..q_end].to_vec();
             let mut k = qkv[q_end..k_end].to_vec();
             let v = qkv[k_end..].to_vec();
-
             apply_rope(&mut q, pos, N_HEADS, &self.rope_factors);
             apply_rope(&mut k, pos, N_KV_HEADS, &self.rope_factors);
 
-            // Update GPU KV cache: write new K/V at position `pos`
             let kv_stride = N_KV_HEADS * HEAD_DIM;
             let kv_off = pos * kv_stride;
             let (ref kbuf, ref vbuf) = self.kv_bufs[li];
-            let k_dst = (kbuf.mapped as *mut u8).add(kv_off * 4);
-            std::ptr::copy_nonoverlapping(k.as_ptr() as *const u8, k_dst, kv_stride * 4);
-            let v_dst = (vbuf.mapped as *mut u8).add(kv_off * 4);
-            std::ptr::copy_nonoverlapping(v.as_ptr() as *const u8, v_dst, kv_stride * 4);
+            std::ptr::copy_nonoverlapping(k.as_ptr() as *const u8,
+                (kbuf.mapped as *mut u8).add(kv_off * 4), kv_stride * 4);
+            std::ptr::copy_nonoverlapping(v.as_ptr() as *const u8,
+                (vbuf.mapped as *mut u8).add(kv_off * 4), kv_stride * 4);
 
-            // GPU grouped-query attention
-            let seq_len = pos + 1;
+            // ---- Batch 2: attention → output projection (attn_q→attn_out→buf_c) ----
             upload(&self.attn_q_buf, &q);
-            let push: [u32; 3] = [seq_len as u32, N_KV_HEADS as u32, heads_per_kv as u32];
-            let pb: Vec<u8> = push.iter().flat_map(|v| v.to_le_bytes()).collect();
+            let seq_len = pos + 1;
+            let attn_push: Vec<u8> = [seq_len as u32, N_KV_HEADS as u32, heads_per_kv as u32]
+                .iter().flat_map(|v| v.to_le_bytes()).collect();
             let kv_bytes = (seq_len * kv_stride) as u64 * 4;
-            engine.dispatch_by_name(
-                "attention",
-                &[&self.attn_q_buf, kbuf, vbuf, &self.attn_out_buf],
-                &[D_MODEL as u64 * 4, kv_bytes, kv_bytes, D_MODEL as u64 * 4],
-                &pb,
-                [N_HEADS as u32, 1, 1],
-            );
-            download(&self.attn_out_buf, &mut attn_out);
+            let out_d = Self::kquant_dispatch(
+                &self.attn_out_buf, &layer.attn_output_buf, &self.buf_c,
+                layer.attn_output_type, layer.attn_output_k, layer.attn_output_n);
+            {
+                let abufs: Vec<&GpuBuffer> = vec![&self.attn_q_buf, kbuf, vbuf, &self.attn_out_buf];
+                let asizes: Vec<u64> = vec![D_MODEL as u64 * 4, kv_bytes, kv_bytes, D_MODEL as u64 * 4];
+                let obufs: Vec<&GpuBuffer> = out_d.1;
+                let osizes: Vec<u64> = out_d.2;
+                engine.dispatch_batch(&[
+                    ("attention", &abufs, &asizes, &attn_push, [N_HEADS as u32, 1, 1]),
+                    (out_d.0.as_str(), &obufs, &osizes, &out_d.3, out_d.4),
+                ]);
+            }
+            download(&self.buf_c, &mut tmp[..D_MODEL]);
 
-            // Output projection + residual
-            gpu_matmul_kquant(engine, &self.buf_a, &layer.attn_output_buf, &self.buf_c,
-                layer.attn_output_type, &attn_out, &mut tmp, layer.attn_output_k, layer.attn_output_n);
-            elemwise_add(hidden, &tmp, &mut norm);
-            hidden.copy_from_slice(&norm);
+            // CPU: attention residual
+            for i in 0..D_MODEL { hidden[i] += tmp[i]; }
 
-            // Pre-FFN RMS norm
-            gpu_rmsnorm(engine, &self.buf_a, &layer.ffn_norm_buf, &self.buf_c, hidden, &mut norm);
+            // ---- Batch 3: rmsnorm → FFN up (buf_a → buf_c → buf_a) ----
+            upload(&self.buf_a, hidden);
+            let up_d = Self::kquant_dispatch(
+                &self.buf_c, &layer.ffn_up_buf, &self.buf_a,
+                layer.ffn_up_type, layer.ffn_up_k, layer.ffn_up_n);
+            {
+                let bufs1: Vec<&GpuBuffer> = vec![&self.buf_a, &layer.ffn_norm_buf, &self.buf_c];
+                let sizes1: Vec<u64> = vec![d as u64 * 4, d as u64 * 4, d as u64 * 4];
+                let bufs2: Vec<&GpuBuffer> = up_d.1;
+                let sizes2: Vec<u64> = up_d.2;
+                engine.dispatch_batch(&[
+                    ("rmsnorm", &bufs1, &sizes1, &norm_push, [1, 1, 1]),
+                    (up_d.0.as_str(), &bufs2, &sizes2, &up_d.3, up_d.4),
+                ]);
+            }
+            download(&self.buf_a, &mut gate_up);
 
-            // SwiGLU FFN
-            gpu_matmul_kquant(engine, &self.buf_a, &layer.ffn_up_buf, &self.buf_c,
-                layer.ffn_up_type, &norm, &mut gate_up, layer.ffn_up_k, layer.ffn_up_n);
+            // CPU: SiLU + gate * up
             let (gate, up) = gate_up.split_at_mut(FFN_DIM);
             cpu_silu(gate);
             for i in 0..FFN_DIM { ffn_mid[i] = gate[i] * up[i]; }
+
+            // ---- Dispatch 4: FFN down (standalone) ----
             gpu_matmul_kquant(engine, &self.buf_a, &layer.ffn_down_buf, &self.buf_c,
                 layer.ffn_down_type, &ffn_mid, &mut tmp, layer.ffn_down_k, layer.ffn_down_n);
 
-            // FFN residual
-            elemwise_add(hidden, &tmp, &mut norm);
-            hidden.copy_from_slice(&norm);
+            // CPU: FFN residual
+            for i in 0..D_MODEL { hidden[i] += tmp[i]; }
         }
 
         cache.len += 1;
-        rms_norm(hidden, &self.output_norm, &mut norm);
 
-        let lt = Instant::now();
+        // Output norm (CPU) + logits (GPU, single batched submit)
+        let mut norm = vec![0.0f32; D_MODEL];
+        rms_norm(hidden, &self.output_norm, &mut norm);
+        upload(&self.buf_a, &norm);
+
+        // Build batch of all logit chunk dispatches
+        let m = 1u32;
+        let k = D_MODEL as u32;
+        let mut dispatches_data: Vec<(Vec<u8>, [u32; 3], usize)> = Vec::new();
+        for (i, (_, chunk_n)) in self.emb_bufs.iter().enumerate() {
+            let n = *chunk_n as u32;
+            let push: [u32; 3] = [m, k, n];
+            let pb: Vec<u8> = push.iter().flat_map(|v| v.to_le_bytes()).collect();
+            dispatches_data.push((pb, [(n + 15) / 16, (m + 15) / 16, 1], i));
+        }
+        let dispatches: Vec<(&str, Vec<&GpuBuffer>, Vec<u64>, &[u8], [u32; 3])> = dispatches_data.iter()
+            .map(|(pb, groups, i)| {
+                let n = self.emb_bufs[*i].1;
+                let emb_buf = &self.emb_bufs[*i].0;
+                let out_buf = &self.logit_out_bufs[*i];
+                (
+                    "matmul_tiled",
+                    vec![&self.buf_a, emb_buf, out_buf],
+                    vec![(m as u64) * (k as u64) * 4, (k as u64) * (n as u64) * 4, (m as u64) * (n as u64) * 4],
+                    pb.as_slice(),
+                    *groups,
+                )
+            }).collect();
+        // Convert to the slice-of-tuples format dispatch_batch expects
+        let dispatch_refs: Vec<(&str, &[&GpuBuffer], &[u64], &[u8], [u32; 3])> = dispatches.iter()
+            .map(|(name, bufs, sizes, push, groups)| (*name, bufs.as_slice(), sizes.as_slice(), *push, *groups))
+            .collect();
+        engine.dispatch_batch_parallel(&dispatch_refs);
+
+        // Download all chunks
         let mut logits = vec![0.0f32; VOCAB_SIZE];
         let mut vocab_offset = 0usize;
-        for (emb_buf, chunk_n) in &self.emb_bufs {
+        for (i, (_, chunk_n)) in self.emb_bufs.iter().enumerate() {
             let n = *chunk_n;
-            let mut chunk_out = vec![0.0f32; n];
-            gpu_matmul_f32(engine, &self.buf_a, emb_buf, &self.logits_buf,
-                &norm, &mut chunk_out, 1, D_MODEL as u32, n as u32);
-            logits[vocab_offset..vocab_offset + n].copy_from_slice(&chunk_out);
+            let src = std::slice::from_raw_parts(self.logit_out_bufs[i].mapped as *const f32, n);
+            logits[vocab_offset..vocab_offset + n].copy_from_slice(src);
             vocab_offset += n;
         }
         logits
