@@ -441,7 +441,6 @@ impl Phi4Model {
             logits[vocab_offset..vocab_offset + n].copy_from_slice(&chunk_out);
             vocab_offset += n;
         }
-        eprintln!("[fwd] logits: {}ms", lt.elapsed().as_millis());
         logits
     }
 
