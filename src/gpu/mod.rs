@@ -1,2 +1,3 @@
 pub mod engine;
-pub use engine::{ComputeEngine, GpuBuffer};
+pub mod ops;
+pub use engine::{ComputeEngine, GpuBuffer, CachedPipeline};
