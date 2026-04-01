@@ -2,7 +2,7 @@
 //! Route 4: Read GGUF blocks directly in shader. Zero requantization loss.
 //! ~1.4GB GPU for 32 layers.
 
-use crate::gpu::{ComputeEngine, GpuBuffer};
+use crate::gpu::{ComputeEngine, GpuBuffer, DescSetHandle};
 use crate::model::gguf::GGUFModel;
 use std::time::Instant;
 
@@ -47,6 +47,11 @@ pub struct LayerWeights {
     pub attn_output_buf: GpuBuffer,   pub attn_output_type: QType,  pub attn_output_k: u32, pub attn_output_n: u32,
     pub ffn_up_buf: GpuBuffer,        pub ffn_up_type: QType,       pub ffn_up_k: u32,      pub ffn_up_n: u32,
     pub ffn_down_buf: GpuBuffer,      pub ffn_down_type: QType,     pub ffn_down_k: u32,    pub ffn_down_n: u32,
+    // Persistent descriptor set handles (pre-allocated at load time)
+    pub ds_norm_qkv: (DescSetHandle, DescSetHandle),    // rmsnorm, QKV matmul
+    pub ds_out_proj: DescSetHandle,                      // output projection matmul
+    pub ds_norm_ffnup: (DescSetHandle, DescSetHandle),  // rmsnorm, FFN up matmul
+    pub ds_ffn_down: DescSetHandle,                      // FFN down matmul
 }
 
 const MAX_SEQ: usize = 2048;
@@ -321,12 +326,17 @@ impl Phi4Model {
             let ffn_norm_buf = engine.alloc_buffer(D_MODEL as u64 * 4);
             upload(&ffn_norm_buf, &ffn_norm);
 
+            // Push with placeholder desc set handles (will be filled after buf_a/buf_c are allocated)
             layers.push(LayerWeights {
                 attn_norm_buf, ffn_norm_buf,
                 attn_qkv_buf: qkv_buf, attn_qkv_type: qkv_t, attn_qkv_k: qkv_k, attn_qkv_n: qkv_n,
                 attn_output_buf: out_buf, attn_output_type: out_t, attn_output_k: out_k, attn_output_n: out_n,
                 ffn_up_buf: up_buf, ffn_up_type: up_t, ffn_up_k: up_k, ffn_up_n: up_n,
                 ffn_down_buf: down_buf, ffn_down_type: down_t, ffn_down_k: down_k, ffn_down_n: down_n,
+                ds_norm_qkv: (DescSetHandle(0), DescSetHandle(0)),
+                ds_out_proj: DescSetHandle(0),
+                ds_norm_ffnup: (DescSetHandle(0), DescSetHandle(0)),
+                ds_ffn_down: DescSetHandle(0),
             });
 
             if i % 8 == 7 || i == N_LAYERS - 1 {
@@ -375,8 +385,52 @@ impl Phi4Model {
             logit_out_bufs.push(buf);
         }
 
-        eprintln!("[phi4] Ready: {:.1}s, {:.1}MB total GPU ({} emb chunks)",
-            t0.elapsed().as_secs_f32(), total_gpu as f64 / 1e6, emb_bufs.len());
+        // Pre-allocate persistent descriptor sets for each layer
+        let d4 = D_MODEL as u64 * 4;
+        for i in 0..N_LAYERS {
+            let layer = &layers[i];
+            let bpr_qkv = layer.attn_qkv_k as u64 / 256;
+            let wb_qkv = layer.attn_qkv_n as u64 * bpr_qkv * layer.attn_qkv_type.block_bytes() as u64;
+            let bpr_out = layer.attn_output_k as u64 / 256;
+            let wb_out = layer.attn_output_n as u64 * bpr_out * layer.attn_output_type.block_bytes() as u64;
+            let bpr_up = layer.ffn_up_k as u64 / 256;
+            let wb_up = layer.ffn_up_n as u64 * bpr_up * layer.ffn_up_type.block_bytes() as u64;
+            let bpr_dn = layer.ffn_down_k as u64 / 256;
+            let wb_dn = layer.ffn_down_n as u64 * bpr_dn * layer.ffn_down_type.block_bytes() as u64;
+
+            // Batch 1: rmsnorm(buf_a→buf_c) then QKV matmul(buf_c→buf_a)
+            let ds_norm1 = engine.pre_allocate_desc_set("rmsnorm",
+                &[&buf_a, &layer.attn_norm_buf, &buf_c], &[d4, d4, d4]);
+            let ds_qkv = engine.pre_allocate_desc_set(layer.attn_qkv_type.shader_name(),
+                &[&buf_c, &layer.attn_qkv_buf, &buf_a],
+                &[layer.attn_qkv_k as u64 * 4, wb_qkv, layer.attn_qkv_n as u64 * 4]);
+
+            // Batch 2 (output proj): attn_out_buf → buf_c
+            let ds_out = engine.pre_allocate_desc_set(layer.attn_output_type.shader_name(),
+                &[&attn_out_buf, &layer.attn_output_buf, &buf_c],
+                &[layer.attn_output_k as u64 * 4, wb_out, layer.attn_output_n as u64 * 4]);
+
+            // Batch 3: rmsnorm(buf_a→buf_c) then FFN up(buf_c→buf_a)
+            let ds_norm2 = engine.pre_allocate_desc_set("rmsnorm",
+                &[&buf_a, &layer.ffn_norm_buf, &buf_c], &[d4, d4, d4]);
+            let ds_up = engine.pre_allocate_desc_set(layer.ffn_up_type.shader_name(),
+                &[&buf_c, &layer.ffn_up_buf, &buf_a],
+                &[layer.ffn_up_k as u64 * 4, wb_up, layer.ffn_up_n as u64 * 4]);
+
+            // FFN down: buf_a → buf_c
+            let ds_dn = engine.pre_allocate_desc_set(layer.ffn_down_type.shader_name(),
+                &[&buf_a, &layer.ffn_down_buf, &buf_c],
+                &[layer.ffn_down_k as u64 * 4, wb_dn, layer.ffn_down_n as u64 * 4]);
+
+            layers[i].ds_norm_qkv = (ds_norm1, ds_qkv);
+            layers[i].ds_out_proj = ds_out;
+            layers[i].ds_norm_ffnup = (ds_norm2, ds_up);
+            layers[i].ds_ffn_down = ds_dn;
+        }
+
+        eprintln!("[phi4] Ready: {:.1}s, {:.1}MB total GPU ({} emb chunks, {} desc sets)",
+            t0.elapsed().as_secs_f32(), total_gpu as f64 / 1e6, emb_bufs.len(),
+            engine.persistent_desc_sets.len());
 
         Phi4Model { embedding, output_norm, layers, buf_a, buf_c, logits_buf, emb_bufs, rope_factors,
                     attn_q_buf, attn_out_buf, kv_bufs, logit_out_bufs }
@@ -404,17 +458,17 @@ impl Phi4Model {
         assert_eq!(hidden.len(), D_MODEL);
         let pos = cache.len;
         let mut qkv = vec![0.0f32; QKV_DIM];
-        let mut attn_out = vec![0.0f32; D_MODEL];
         let mut gate_up = vec![0.0f32; GATE_UP_DIM];
         let mut ffn_mid = vec![0.0f32; FFN_DIM];
         let mut tmp = vec![0.0f32; D_MODEL];
         let heads_per_kv = N_HEADS / N_KV_HEADS;
         let d = D_MODEL as u32;
+        let norm_push: Vec<u8> = [1u32, d].iter().flat_map(|v| v.to_le_bytes()).collect();
+        let kv_stride = N_KV_HEADS * HEAD_DIM;
 
         for (li, layer) in self.layers.iter().enumerate() {
             // ---- Batch 1: rmsnorm → QKV matmul (buf_a → buf_c → buf_a) ----
             upload(&self.buf_a, hidden);
-            let norm_push: Vec<u8> = [1u32, d].iter().flat_map(|v| v.to_le_bytes()).collect();
             let qkv_d = Self::kquant_dispatch(
                 &self.buf_c, &layer.attn_qkv_buf, &self.buf_a,
                 layer.attn_qkv_type, layer.attn_qkv_k, layer.attn_qkv_n);
@@ -437,7 +491,6 @@ impl Phi4Model {
             apply_rope(&mut q, pos, N_HEADS, &self.rope_factors);
             apply_rope(&mut k, pos, N_KV_HEADS, &self.rope_factors);
 
-            let kv_stride = N_KV_HEADS * HEAD_DIM;
             let kv_off = pos * kv_stride;
             let (ref kbuf, ref vbuf) = self.kv_bufs[li];
             std::ptr::copy_nonoverlapping(k.as_ptr() as *const u8,
@@ -445,23 +498,24 @@ impl Phi4Model {
             std::ptr::copy_nonoverlapping(v.as_ptr() as *const u8,
                 (vbuf.mapped as *mut u8).add(kv_off * 4), kv_stride * 4);
 
-            // ---- Batch 2: attention → output projection (attn_q→attn_out→buf_c) ----
+            // ---- Batch 2: attention → output projection (dynamic desc, single submit) ----
             upload(&self.attn_q_buf, &q);
             let seq_len = pos + 1;
             let attn_push: Vec<u8> = [seq_len as u32, N_KV_HEADS as u32, heads_per_kv as u32]
                 .iter().flat_map(|v| v.to_le_bytes()).collect();
             let kv_bytes = (seq_len * kv_stride) as u64 * 4;
-            let out_d = Self::kquant_dispatch(
-                &self.attn_out_buf, &layer.attn_output_buf, &self.buf_c,
-                layer.attn_output_type, layer.attn_output_k, layer.attn_output_n);
+            let out_push: Vec<u8> = [layer.attn_output_k, layer.attn_output_n]
+                .iter().flat_map(|v| v.to_le_bytes()).collect();
             {
                 let abufs: Vec<&GpuBuffer> = vec![&self.attn_q_buf, kbuf, vbuf, &self.attn_out_buf];
                 let asizes: Vec<u64> = vec![D_MODEL as u64 * 4, kv_bytes, kv_bytes, D_MODEL as u64 * 4];
-                let obufs: Vec<&GpuBuffer> = out_d.1;
-                let osizes: Vec<u64> = out_d.2;
+                let obufs: Vec<&GpuBuffer> = vec![&self.attn_out_buf, &layer.attn_output_buf, &self.buf_c];
+                let bpr = layer.attn_output_k as u64 / 256;
+                let wb = layer.attn_output_n as u64 * bpr * layer.attn_output_type.block_bytes() as u64;
+                let osizes: Vec<u64> = vec![layer.attn_output_k as u64 * 4, wb, layer.attn_output_n as u64 * 4];
                 engine.dispatch_batch(&[
                     ("attention", &abufs, &asizes, &attn_push, [N_HEADS as u32, 1, 1]),
-                    (out_d.0.as_str(), &obufs, &osizes, &out_d.3, out_d.4),
+                    (layer.attn_output_type.shader_name(), &obufs, &osizes, &out_push, [layer.attn_output_n, 1, 1]),
                 ]);
             }
             download(&self.buf_c, &mut tmp[..D_MODEL]);

@@ -8,6 +8,10 @@ use ash::Device;
 use std::collections::HashMap;
 use std::ffi::CString;
 
+/// Opaque handle to a pre-allocated descriptor set.
+#[derive(Clone, Copy)]
+pub struct DescSetHandle(pub usize);
+
 pub struct ComputeEngine {
     pub instance: ash::Instance,
     pub device: Device,
@@ -19,8 +23,9 @@ pub struct ComputeEngine {
     pub fence: vk::Fence,
     pub desc_pool: vk::DescriptorPool,
     pub pipeline_cache: HashMap<String, CachedPipeline>,
-    pub buffer_pool: HashMap<u64, Vec<GpuBuffer>>,  // size-bucketed pool
+    pub buffer_pool: HashMap<u64, Vec<GpuBuffer>>,
     pub shader_dir: String,
+    pub persistent_desc_sets: Vec<vk::DescriptorSet>,
 }
 
 pub struct CachedPipeline {
@@ -115,6 +120,7 @@ impl ComputeEngine {
             pipeline_cache: HashMap::new(),
             buffer_pool: HashMap::new(),
             shader_dir: shader_dir.to_string(),
+            persistent_desc_sets: Vec::new(),
         }
     }
 
@@ -228,6 +234,136 @@ impl ComputeEngine {
             }
         }
         self.alloc_buffer(bucket)
+    }
+
+    /// Pre-allocate a descriptor set for a specific pipeline + buffer binding.
+    /// Returns a handle for use with dispatch_persistent().
+    pub unsafe fn pre_allocate_desc_set(
+        &mut self, pipeline_name: &str, buffers: &[&GpuBuffer], buffer_sizes: &[u64],
+    ) -> DescSetHandle {
+        let pipeline = &self.pipeline_cache[pipeline_name];
+        let ds_alloc = vk::DescriptorSetAllocateInfo::default()
+            .descriptor_pool(self.desc_pool)
+            .set_layouts(std::slice::from_ref(&pipeline.desc_set_layout));
+        let ds = self.device.allocate_descriptor_sets(&ds_alloc).unwrap()[0];
+
+        let buf_infos: Vec<_> = buffers.iter().zip(buffer_sizes).map(|(b, &s)| {
+            vk::DescriptorBufferInfo { buffer: b.buffer, offset: 0, range: s }
+        }).collect();
+        let writes: Vec<_> = buf_infos.iter().enumerate().map(|(i, info)| {
+            vk::WriteDescriptorSet::default()
+                .dst_set(ds)
+                .dst_binding(i as u32)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(std::slice::from_ref(info))
+        }).collect();
+        self.device.update_descriptor_sets(&writes, &[]);
+
+        let handle = DescSetHandle(self.persistent_desc_sets.len());
+        self.persistent_desc_sets.push(ds);
+        handle
+    }
+
+    /// Fast dispatch using a pre-allocated descriptor set — no alloc/write/free overhead.
+    pub unsafe fn dispatch_persistent(
+        &self,
+        pipeline_name: &str,
+        handle: DescSetHandle,
+        push_constants: &[u8],
+        groups: [u32; 3],
+    ) {
+        let pipeline = &self.pipeline_cache[pipeline_name];
+        let desc_set = self.persistent_desc_sets[handle.0];
+
+        self.device.reset_command_buffer(self.cmd_buf, vk::CommandBufferResetFlags::empty()).unwrap();
+        let begin = vk::CommandBufferBeginInfo::default()
+            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+        self.device.begin_command_buffer(self.cmd_buf, &begin).unwrap();
+        self.device.cmd_bind_pipeline(self.cmd_buf, vk::PipelineBindPoint::COMPUTE, pipeline.pipeline);
+        self.device.cmd_bind_descriptor_sets(
+            self.cmd_buf, vk::PipelineBindPoint::COMPUTE,
+            pipeline.layout, 0, &[desc_set], &[]);
+        if !push_constants.is_empty() {
+            self.device.cmd_push_constants(
+                self.cmd_buf, pipeline.layout,
+                vk::ShaderStageFlags::COMPUTE, 0, push_constants);
+        }
+        self.device.cmd_dispatch(self.cmd_buf, groups[0], groups[1], groups[2]);
+
+        let barrier = vk::MemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+            .dst_access_mask(vk::AccessFlags::HOST_READ);
+        self.device.cmd_pipeline_barrier(
+            self.cmd_buf,
+            vk::PipelineStageFlags::COMPUTE_SHADER,
+            vk::PipelineStageFlags::HOST,
+            vk::DependencyFlags::empty(),
+            &[barrier], &[], &[]);
+
+        self.device.end_command_buffer(self.cmd_buf).unwrap();
+
+        let submit = vk::SubmitInfo::default()
+            .command_buffers(std::slice::from_ref(&self.cmd_buf));
+        self.device.reset_fences(&[self.fence]).unwrap();
+        self.device.queue_submit(self.queue, &[submit], self.fence).unwrap();
+        self.device.wait_for_fences(&[self.fence], true, u64::MAX).unwrap();
+    }
+
+    /// Batch dispatch using pre-allocated descriptor sets — fastest path.
+    pub unsafe fn dispatch_batch_persistent(
+        &self,
+        dispatches: &[(&str, DescSetHandle, &[u8], [u32; 3])],
+        sequential: bool,
+    ) {
+        self.device.reset_command_buffer(self.cmd_buf, vk::CommandBufferResetFlags::empty()).unwrap();
+        let begin = vk::CommandBufferBeginInfo::default()
+            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+        self.device.begin_command_buffer(self.cmd_buf, &begin).unwrap();
+
+        for (name, handle, push, groups) in dispatches {
+            let pipeline = &self.pipeline_cache[*name];
+            let desc_set = self.persistent_desc_sets[handle.0];
+            self.device.cmd_bind_pipeline(self.cmd_buf, vk::PipelineBindPoint::COMPUTE, pipeline.pipeline);
+            self.device.cmd_bind_descriptor_sets(
+                self.cmd_buf, vk::PipelineBindPoint::COMPUTE,
+                pipeline.layout, 0, &[desc_set], &[]);
+            if !push.is_empty() {
+                self.device.cmd_push_constants(
+                    self.cmd_buf, pipeline.layout,
+                    vk::ShaderStageFlags::COMPUTE, 0, push);
+            }
+            self.device.cmd_dispatch(self.cmd_buf, groups[0], groups[1], groups[2]);
+
+            if sequential {
+                let barrier = vk::MemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::SHADER_READ);
+                self.device.cmd_pipeline_barrier(
+                    self.cmd_buf,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &[barrier], &[], &[]);
+            }
+        }
+
+        let host_barrier = vk::MemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+            .dst_access_mask(vk::AccessFlags::HOST_READ);
+        self.device.cmd_pipeline_barrier(
+            self.cmd_buf,
+            vk::PipelineStageFlags::COMPUTE_SHADER,
+            vk::PipelineStageFlags::HOST,
+            vk::DependencyFlags::empty(),
+            &[host_barrier], &[], &[]);
+
+        self.device.end_command_buffer(self.cmd_buf).unwrap();
+
+        let submit = vk::SubmitInfo::default()
+            .command_buffers(std::slice::from_ref(&self.cmd_buf));
+        self.device.reset_fences(&[self.fence]).unwrap();
+        self.device.queue_submit(self.queue, &[submit], self.fence).unwrap();
+        self.device.wait_for_fences(&[self.fence], true, u64::MAX).unwrap();
     }
 
     /// Return buffer to pool
