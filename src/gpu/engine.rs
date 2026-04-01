@@ -112,9 +112,9 @@ impl ComputeEngine {
             cmd_buf,
             fence,
             desc_pool,
-            pub pipeline_cache: HashMap::new(),
-            pub buffer_pool: HashMap::new(),
-            pub shader_dir: shader_dir.to_string(),
+            pipeline_cache: HashMap::new(),
+            buffer_pool: HashMap::new(),
+            shader_dir: shader_dir.to_string(),
         }
     }
 
