@@ -29,7 +29,9 @@ const Q4_BLOCK_SIZE: usize = 32;
 /// Per-layer weights — Q4 packed on GPU
 pub struct LayerWeights {
     pub attn_norm: Vec<f32>,
+    pub attn_norm_buf: GpuBuffer,
     pub ffn_norm: Vec<f32>,
+    pub ffn_norm_buf: GpuBuffer,
     // Q4 packed weights (uint32, 8 nibbles per word) + scales (f32, one per block of 32)
     pub attn_qkv_packed: GpuBuffer,
     pub attn_qkv_scales: GpuBuffer,
@@ -340,6 +342,27 @@ unsafe fn gpu_matmul_q4_persistent(
     download(buf_c, c);
 }
 
+
+/// GPU RMS norm: out = weight * x / sqrt(mean(x^2) + eps)
+unsafe fn gpu_rmsnorm(
+    engine: &ComputeEngine,
+    buf_in: &GpuBuffer, weight_buf: &GpuBuffer, buf_out: &GpuBuffer,
+    x: &[f32], out: &mut [f32],
+    num_rows: u32, row_size: u32,
+) {
+    upload(buf_in, x);
+    let push: [u32; 2] = [num_rows, row_size];
+    let pb: Vec<u8> = push.iter().flat_map(|v| v.to_le_bytes()).collect();
+    engine.dispatch_by_name(
+        "rmsnorm",
+        &[buf_in, weight_buf, buf_out],
+        &[(num_rows * row_size) as u64 * 4, row_size as u64 * 4, (num_rows * row_size) as u64 * 4],
+        &pb,
+        [num_rows, 1, 1],
+    );
+    download(buf_out, out);
+}
+
 // ============================================================================
 // Model
 // ============================================================================
@@ -358,6 +381,7 @@ impl Phi4Model {
         // Pre-create the matmul_q4 pipeline (4 buffers, 12 bytes push constants)
         engine.get_pipeline("matmul_q4", 4, 12);
         engine.get_pipeline("matmul_tiled", 3, 12);
+        engine.get_pipeline("rmsnorm", 3, 8);
 
         let mut layers = Vec::with_capacity(N_LAYERS);
         for i in 0..N_LAYERS {
@@ -402,9 +426,17 @@ impl Phi4Model {
             let down_scales_buf = engine.alloc_buffer(down_scales.len() as u64 * 4);
             upload(&down_scales_buf, &down_scales);
 
+            let attn_norm_data = dequant_tensor(gguf, &format!("{}.attn_norm.weight", prefix));
+            let ffn_norm_data = dequant_tensor(gguf, &format!("{}.ffn_norm.weight", prefix));
+            let attn_norm_buf = engine.alloc_buffer(D_MODEL as u64 * 4);
+            upload(&attn_norm_buf, &attn_norm_data);
+            let ffn_norm_buf = engine.alloc_buffer(D_MODEL as u64 * 4);
+            upload(&ffn_norm_buf, &ffn_norm_data);
             layers.push(LayerWeights {
-                attn_norm: dequant_tensor(gguf, &format!("{}.attn_norm.weight", prefix)),
-                ffn_norm: dequant_tensor(gguf, &format!("{}.ffn_norm.weight", prefix)),
+                attn_norm: attn_norm_data,
+                attn_norm_buf,
+                ffn_norm: ffn_norm_data,
+                ffn_norm_buf,
                 attn_qkv_packed: qkv_packed_buf,
                 attn_qkv_scales: qkv_scales_buf,
                 attn_output_packed: out_packed_buf,
@@ -491,7 +523,8 @@ impl Phi4Model {
 
         for (li, layer) in self.layers.iter().enumerate() {
             // === Attention ===
-            rms_norm(hidden, &layer.attn_norm, &mut norm);
+            gpu_rmsnorm(engine, &self.buf_a, &layer.attn_norm_buf, &self.buf_c,
+                hidden, &mut norm, 1, D_MODEL as u32);
 
             // QKV: [1,3072] x [3072,5120] = [1,5120]
             gpu_matmul_q4_persistent(engine,
@@ -519,7 +552,8 @@ impl Phi4Model {
             hidden.copy_from_slice(&norm);
 
             // === FFN ===
-            rms_norm(hidden, &layer.ffn_norm, &mut norm);
+            gpu_rmsnorm(engine, &self.buf_a, &layer.ffn_norm_buf, &self.buf_c,
+                hidden, &mut norm, 1, D_MODEL as u32);
 
             // Up: [1,3072] x [3072,16384] = [1,16384]
             gpu_matmul_q4_persistent(engine,
