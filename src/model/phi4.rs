@@ -34,6 +34,7 @@ impl QType {
     fn block_bytes(&self) -> usize {
         match self { QType::Q4K => 144, QType::Q5K => 176, QType::Q6K => 210 }
     }
+    fn workgroups(&self, n: u32) -> u32 { n }
     fn from_gguf(typ: u32) -> Self {
         match typ { 12 => QType::Q4K, 13 => QType::Q5K, 14 => QType::Q6K, _ => panic!("Unsupported quant type {}", typ) }
     }
@@ -226,7 +227,7 @@ unsafe fn gpu_matmul_kquant(
         &[buf_a, weight_buf, buf_c],
         &[k as u64 * 4, total_weight_bytes, n as u64 * 4],
         &pb,
-        [n, 1, 1],
+        [qtype.workgroups(n), 1, 1],
     );
     download(buf_c, c);
 }
@@ -450,7 +451,7 @@ impl Phi4Model {
             vec![buf_in, weight_buf, buf_out],
             vec![k as u64 * 4, total_weight_bytes, n as u64 * 4],
             pb,
-            [n, 1, 1],
+            [qtype.workgroups(n), 1, 1],
         )
     }
 
