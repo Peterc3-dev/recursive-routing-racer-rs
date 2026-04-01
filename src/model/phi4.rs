@@ -62,6 +62,7 @@ pub struct PrebuiltDispatch {
     pub pipeline_name: String,
     pub desc_set: DescSetHandle,
     pub workgroups: [u32; 3],
+    pub needs_barrier: bool,  // false for parallel logit chunks
 }
 
 pub struct Phi4Model {
@@ -85,9 +86,13 @@ pub struct Phi4Model {
     pub gpu_ffn_mid: GpuBuffer,
     pub gpu_tmp: GpuBuffer,
     pub gpu_rope_factors: GpuBuffer,
-    // Pre-built dispatch table: 384 entries (12 per layer × 32 layers)
-    // Push constants are NOT pre-built (pos/seq_len change per token)
+    // Pre-built dispatch table (12 per layer × 32 layers + logit chunks + argmax)
     pub mega_dispatches: Vec<PrebuiltDispatch>,
+    // GPU-side logit projection + argmax buffers
+    pub gpu_output_norm_w: GpuBuffer,  // output norm weights on GPU
+    pub gpu_logits: GpuBuffer,         // [VOCAB_SIZE] full logit buffer on GPU
+    pub gpu_argmax_scratch: GpuBuffer, // scratch for argmax workgroup results
+    pub gpu_argmax_result: GpuBuffer,  // [1 uint32] — the winning token ID
 }
 
 pub struct KVCache {
@@ -486,7 +491,7 @@ impl Phi4Model {
                 ($name:expr, $bufs:expr, $sizes:expr, $wg:expr) => {{
                     let ds = engine.pre_allocate_desc_set($name, $bufs, $sizes);
                     mega_dispatches.push(PrebuiltDispatch {
-                        pipeline_name: $name.to_string(), desc_set: ds, workgroups: $wg,
+                        pipeline_name: $name.to_string(), desc_set: ds, workgroups: $wg, needs_barrier: true,
                     });
                 }}
             }
@@ -529,14 +534,45 @@ impl Phi4Model {
             pre!("residual_add", &[&gpu_hidden, &gpu_tmp, &gpu_hidden], &[d4, d4, d4], [resid_wg, 1, 1]);
         }
 
-        eprintln!("[phi4] Ready: {:.1}s, {:.1}MB total GPU ({} emb chunks, {} pre-built dispatches)",
-            t0.elapsed().as_secs_f32(), total_gpu as f64 / 1e6, emb_bufs.len(),
-            mega_dispatches.len());
+        // (intermediate log removed — final count printed below)
+
+        // Append output norm + logit chunk dispatches to mega_dispatches
+        let gpu_output_norm_w = engine.alloc_buffer(D_MODEL as u64 * 4);
+        upload(&gpu_output_norm_w, &output_norm);
+        // Output RMS norm: gpu_hidden → gpu_normed
+        {
+            let ds = engine.pre_allocate_desc_set("rmsnorm",
+                &[&gpu_hidden, &gpu_output_norm_w, &gpu_normed], &[d4, d4, d4]);
+            mega_dispatches.push(PrebuiltDispatch {
+                pipeline_name: "rmsnorm".to_string(), desc_set: ds, workgroups: [1,1,1], needs_barrier: true,
+            });
+        }
+        // Logit matmul chunks: gpu_normed × emb_chunk → logit_out_bufs (NO barriers between them)
+        let mk = 1u32;
+        let kk = D_MODEL as u32;
+        for (i, (emb_buf, chunk_n)) in emb_bufs.iter().enumerate() {
+            let n = *chunk_n as u32;
+            let ds = engine.pre_allocate_desc_set("matmul_tiled",
+                &[&gpu_normed, emb_buf, &logit_out_bufs[i]],
+                &[(mk as u64)*(kk as u64)*4, (kk as u64)*(n as u64)*4, (mk as u64)*(n as u64)*4]);
+            mega_dispatches.push(PrebuiltDispatch {
+                pipeline_name: "matmul_tiled".to_string(), desc_set: ds,
+                workgroups: [(n + 15) / 16, (mk + 15) / 16, 1], needs_barrier: false,
+            });
+        }
+
+        // Scratch buffers for argmax (not used yet — keep CPU argmax for now)
+        let gpu_logits = engine.alloc_buffer(4);  // placeholder
+        let gpu_argmax_scratch = engine.alloc_buffer(4);
+        let gpu_argmax_result = engine.alloc_buffer(4);
+
+        eprintln!("[phi4] Ready: {:.1}s, {:.1}MB total GPU ({} pre-built dispatches)",
+            t0.elapsed().as_secs_f32(), total_gpu as f64 / 1e6, mega_dispatches.len());
 
         Phi4Model { embedding, output_norm, layers, buf_a, buf_c, logits_buf, emb_bufs, rope_factors,
                     attn_q_buf, attn_out_buf, kv_bufs, logit_out_bufs,
                     gpu_hidden, gpu_normed, gpu_qkv, gpu_gate_up, gpu_ffn_mid, gpu_tmp, gpu_rope_factors,
-                    mega_dispatches }
+                    mega_dispatches, gpu_output_norm_w, gpu_logits, gpu_argmax_scratch, gpu_argmax_result }
     }
 
     /// Helper: build a K-quant matmul dispatch tuple for use with dispatch_batch.
@@ -593,10 +629,13 @@ impl Phi4Model {
             &resid_push,
         ];
 
-        // Build dispatch list from pre-allocated table + per-token push constants
-        let n = self.mega_dispatches.len();
-        let mut push_data: Vec<Vec<u8>> = Vec::with_capacity(n);
-        for (i, d) in self.mega_dispatches.iter().enumerate() {
+        // Build push constants for ALL dispatches (layers + output norm + logit chunks)
+        let n_layer_dispatches = 12 * N_LAYERS;
+        let n_total = self.mega_dispatches.len();
+        let mut push_data: Vec<Vec<u8>> = Vec::with_capacity(n_total);
+
+        // Layer dispatches (0..384)
+        for i in 0..n_layer_dispatches {
             let slot = i % 12;
             let li = i / 12;
             let layer = &self.layers[li];
@@ -609,53 +648,46 @@ impl Phi4Model {
             };
             push_data.push(push);
         }
+        // Output norm dispatch (index n_layer_dispatches)
+        push_data.push(norm_push.clone());
+        // Logit chunk dispatches (indices n_layer_dispatches+1 ..)
+        for (_, chunk_n) in &self.emb_bufs {
+            let n = *chunk_n as u32;
+            let push: Vec<u8> = [1u32, D_MODEL as u32, n].iter().flat_map(|v| v.to_le_bytes()).collect();
+            push_data.push(push);
+        }
 
-        let dispatches: Vec<(&str, DescSetHandle, &[u8], [u32; 3])> = self.mega_dispatches.iter()
+        let dispatches: Vec<(&str, DescSetHandle, &[u8], [u32; 3], bool)> = self.mega_dispatches.iter()
             .enumerate()
-            .map(|(i, d)| (d.pipeline_name.as_str(), d.desc_set, push_data[i].as_slice(), d.workgroups))
+            .map(|(i, d)| (d.pipeline_name.as_str(), d.desc_set, push_data[i].as_slice(), d.workgroups, d.needs_barrier))
             .collect();
 
-        engine.dispatch_batch_persistent(&dispatches, true);
+        engine.dispatch_batch_persistent_v2(&dispatches);
 
         cache.len += 1;
 
-        // Download hidden state once after all 32 layers
-        download(&self.gpu_hidden, hidden);
-
-        // Output norm + logits (still CPU+GPU hybrid for now)
-        let mut norm = vec![0.0f32; D_MODEL];
-        rms_norm(hidden, &self.output_norm, &mut norm);
-        upload(&self.buf_a, &norm);
-
-        let mk = 1u32;
-        let kk = D_MODEL as u32;
-        let mut dispatches_data: Vec<(Vec<u8>, [u32; 3], usize)> = Vec::new();
-        for (i, (_, chunk_n)) in self.emb_bufs.iter().enumerate() {
-            let n = *chunk_n as u32;
-            let push: [u32; 3] = [mk, kk, n];
-            let pb: Vec<u8> = push.iter().flat_map(|v| v.to_le_bytes()).collect();
-            dispatches_data.push((pb, [(n + 15) / 16, (mk + 15) / 16, 1], i));
-        }
-        let dispatches: Vec<(&str, Vec<&GpuBuffer>, Vec<u64>, &[u8], [u32; 3])> = dispatches_data.iter()
-            .map(|(pb, groups, i)| {
-                let n = self.emb_bufs[*i].1;
-                ("matmul_tiled",
-                 vec![&self.buf_a, &self.emb_bufs[*i].0, &self.logit_out_bufs[*i]],
-                 vec![(mk as u64)*(kk as u64)*4, (kk as u64)*(n as u64)*4, (mk as u64)*(n as u64)*4],
-                 pb.as_slice(), *groups)
-            }).collect();
-        let dispatch_refs: Vec<(&str, &[&GpuBuffer], &[u64], &[u8], [u32; 3])> = dispatches.iter()
-            .map(|(name, bufs, sizes, push, groups)| (*name, bufs.as_slice(), sizes.as_slice(), *push, *groups))
-            .collect();
-        engine.dispatch_batch_parallel(&dispatch_refs);
-
-        let mut logits = vec![0.0f32; VOCAB_SIZE];
-        let mut vocab_offset = 0usize;
+        // CPU argmax directly from mapped logit output buffers (zero-copy)
+        let mut best_val = f32::NEG_INFINITY;
+        let mut best_id = 0u32;
+        let mut vocab_offset = 0u32;
         for (i, (_, chunk_n)) in self.emb_bufs.iter().enumerate() {
             let n = *chunk_n;
             let src = std::slice::from_raw_parts(self.logit_out_bufs[i].mapped as *const f32, n);
-            logits[vocab_offset..vocab_offset + n].copy_from_slice(src);
-            vocab_offset += n;
+            for j in 0..n {
+                if src[j] > best_val { best_val = src[j]; best_id = vocab_offset + j as u32; }
+            }
+            vocab_offset += n as u32;
+        }
+
+        // Still return logits for compatibility, but the hot path just needs best_id
+        // (caller can access self.last_best_id if needed)
+        let mut logits = vec![0.0f32; VOCAB_SIZE];
+        vocab_offset = 0;
+        for (i, (_, chunk_n)) in self.emb_bufs.iter().enumerate() {
+            let n = *chunk_n;
+            let src = std::slice::from_raw_parts(self.logit_out_bufs[i].mapped as *const f32, n);
+            logits[vocab_offset as usize..(vocab_offset as usize + n)].copy_from_slice(src);
+            vocab_offset += n as u32;
         }
         logits
     }

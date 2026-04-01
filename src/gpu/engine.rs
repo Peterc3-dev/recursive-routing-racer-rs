@@ -71,13 +71,16 @@ impl ComputeEngine {
             p.queue_flags.contains(vk::QueueFlags::COMPUTE)
         }).unwrap() as u32;
 
-        // Device + queue
+        // Device + queue (with f16/i8 + subgroup features)
         let queue_priority = [1.0f32];
         let queue_info = vk::DeviceQueueCreateInfo::default()
             .queue_family_index(queue_family)
             .queue_priorities(&queue_priority);
+        let mut f16_features = vk::PhysicalDeviceShaderFloat16Int8Features::default()
+            .shader_float16(true);
         let device_info = vk::DeviceCreateInfo::default()
-            .queue_create_infos(std::slice::from_ref(&queue_info));
+            .queue_create_infos(std::slice::from_ref(&queue_info))
+            .push_next(&mut f16_features);
         let device = instance.create_device(physical_device, &device_info, None).unwrap();
         let queue = device.get_device_queue(queue_family, 0);
 
@@ -310,17 +313,17 @@ impl ComputeEngine {
     }
 
     /// Batch dispatch using pre-allocated descriptor sets — fastest path.
-    pub unsafe fn dispatch_batch_persistent(
+    /// Each dispatch can individually control whether a barrier follows it.
+    pub unsafe fn dispatch_batch_persistent_v2(
         &self,
-        dispatches: &[(&str, DescSetHandle, &[u8], [u32; 3])],
-        sequential: bool,
+        dispatches: &[(&str, DescSetHandle, &[u8], [u32; 3], bool)],  // last: needs_barrier
     ) {
         self.device.reset_command_buffer(self.cmd_buf, vk::CommandBufferResetFlags::empty()).unwrap();
         let begin = vk::CommandBufferBeginInfo::default()
             .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
         self.device.begin_command_buffer(self.cmd_buf, &begin).unwrap();
 
-        for (name, handle, push, groups) in dispatches {
+        for (name, handle, push, groups, barrier) in dispatches {
             let pipeline = &self.pipeline_cache[*name];
             let desc_set = self.persistent_desc_sets[handle.0];
             self.device.cmd_bind_pipeline(self.cmd_buf, vk::PipelineBindPoint::COMPUTE, pipeline.pipeline);
@@ -334,8 +337,8 @@ impl ComputeEngine {
             }
             self.device.cmd_dispatch(self.cmd_buf, groups[0], groups[1], groups[2]);
 
-            if sequential {
-                let barrier = vk::MemoryBarrier::default()
+            if *barrier {
+                let b = vk::MemoryBarrier::default()
                     .src_access_mask(vk::AccessFlags::SHADER_WRITE)
                     .dst_access_mask(vk::AccessFlags::SHADER_READ);
                 self.device.cmd_pipeline_barrier(
@@ -343,7 +346,7 @@ impl ComputeEngine {
                     vk::PipelineStageFlags::COMPUTE_SHADER,
                     vk::PipelineStageFlags::COMPUTE_SHADER,
                     vk::DependencyFlags::empty(),
-                    &[barrier], &[], &[]);
+                    &[b], &[], &[]);
             }
         }
 
