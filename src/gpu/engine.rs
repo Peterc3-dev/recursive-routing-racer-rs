@@ -189,7 +189,7 @@ impl ComputeEngine {
 
     /// Allocate a host-visible, coherent GPU buffer
     pub unsafe fn alloc_buffer(&self, size: u64) -> GpuBuffer {
-        eprintln!("[alloc] size={}", size);
+        // eprintln!("[alloc] size={}", size);
         let buf_info = vk::BufferCreateInfo::default()
             .size(size)
             .usage(vk::BufferUsageFlags::STORAGE_BUFFER)
@@ -213,7 +213,7 @@ impl ComputeEngine {
             .memory_type_index(mem_type);
         let memory = self.device.allocate_memory(&alloc, None).unwrap();
         self.device.bind_buffer_memory(buffer, memory, 0).unwrap();
-        eprintln!("[alloc] bound ok");
+        // eprintln!("[alloc] bound ok");
         let mapped = self.device.map_memory(memory, 0, size, vk::MemoryMapFlags::empty()).unwrap();
 
         GpuBuffer { buffer, memory, mapped, capacity: size }
