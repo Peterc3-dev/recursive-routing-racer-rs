@@ -25,7 +25,7 @@ fn main() {
         // Init Vulkan engine
         let mut engine = gpu::ComputeEngine::new(SHADER_DIR);
 
-        // Load model weights (dequantize to F32)
+        // Load model weights (Q4 quantized, persistent on GPU)
         let phi4 = model::Phi4Model::load_from_gguf(&gguf, &mut engine);
 
         eprintln!("\n[rrr] Total load time: {:.1}s", t0.elapsed().as_secs_f32());
