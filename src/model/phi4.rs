@@ -57,6 +57,13 @@ pub struct LayerWeights {
 
 const MAX_SEQ: usize = 2048;
 
+/// Pre-built dispatch entry for the mega-batch (zero allocation in hot path).
+pub struct PrebuiltDispatch {
+    pub pipeline_name: String,
+    pub desc_set: DescSetHandle,
+    pub workgroups: [u32; 3],
+}
+
 pub struct Phi4Model {
     pub embedding: Vec<f32>,
     pub output_norm: Vec<f32>,
@@ -70,14 +77,17 @@ pub struct Phi4Model {
     pub attn_out_buf: GpuBuffer,
     pub kv_bufs: Vec<(GpuBuffer, GpuBuffer)>,
     pub logit_out_bufs: Vec<GpuBuffer>,
-    // GPU-resident pipeline buffers (zero-CPU forward pass)
-    pub gpu_hidden: GpuBuffer,     // [D_MODEL] — persistent hidden state
-    pub gpu_normed: GpuBuffer,     // [D_MODEL] — post-RMS-norm
-    pub gpu_qkv: GpuBuffer,        // [QKV_DIM] — QKV output / scratch
-    pub gpu_gate_up: GpuBuffer,    // [GATE_UP_DIM] — FFN up output
-    pub gpu_ffn_mid: GpuBuffer,    // [FFN_DIM] — SiLU output
-    pub gpu_tmp: GpuBuffer,        // [D_MODEL] — output proj / FFN down scratch
-    pub gpu_rope_factors: GpuBuffer, // [ROPE_DIM/2] — rope scaling factors on GPU
+    // GPU-resident pipeline buffers
+    pub gpu_hidden: GpuBuffer,
+    pub gpu_normed: GpuBuffer,
+    pub gpu_qkv: GpuBuffer,
+    pub gpu_gate_up: GpuBuffer,
+    pub gpu_ffn_mid: GpuBuffer,
+    pub gpu_tmp: GpuBuffer,
+    pub gpu_rope_factors: GpuBuffer,
+    // Pre-built dispatch table: 384 entries (12 per layer × 32 layers)
+    // Push constants are NOT pre-built (pos/seq_len change per token)
+    pub mega_dispatches: Vec<PrebuiltDispatch>,
 }
 
 pub struct KVCache {
@@ -450,13 +460,83 @@ impl Phi4Model {
         let gpu_rope_factors = engine.alloc_buffer((ROPE_DIM as u64 / 2) * 4);
         upload(&gpu_rope_factors, &rope_factors);
 
-        eprintln!("[phi4] Ready: {:.1}s, {:.1}MB total GPU ({} emb chunks, {} desc sets)",
+        // Pre-allocate ALL 384 descriptor sets for the mega-batch
+        let d4 = D_MODEL as u64 * 4;
+        let kv_max_bytes = (MAX_SEQ * N_KV_HEADS * HEAD_DIM) as u64 * 4;
+        let mut mega_dispatches: Vec<PrebuiltDispatch> = Vec::with_capacity(12 * N_LAYERS);
+
+        for i in 0..N_LAYERS {
+            let layer = &layers[i];
+            let (ref kb, ref vb) = kv_bufs[i];
+            let bpr_qkv = layer.attn_qkv_k as u64 / 256;
+            let wb_qkv = layer.attn_qkv_n as u64 * bpr_qkv * layer.attn_qkv_type.block_bytes() as u64;
+            let bpr_out = layer.attn_output_k as u64 / 256;
+            let wb_out = layer.attn_output_n as u64 * bpr_out * layer.attn_output_type.block_bytes() as u64;
+            let bpr_up = layer.ffn_up_k as u64 / 256;
+            let wb_up = layer.ffn_up_n as u64 * bpr_up * layer.ffn_up_type.block_bytes() as u64;
+            let bpr_dn = layer.ffn_down_k as u64 / 256;
+            let wb_dn = layer.ffn_down_n as u64 * bpr_dn * layer.ffn_down_type.block_bytes() as u64;
+            let rope_pairs = (N_HEADS + N_KV_HEADS) * (ROPE_DIM / 2);
+            let rope_wg = ((rope_pairs + 63) / 64) as u32;
+            let kv_store_wg = (((N_KV_HEADS * HEAD_DIM) as u32 + 255) / 256) as u32;
+            let silu_wg = ((FFN_DIM as u32 + 255) / 256) as u32;
+            let resid_wg = ((D_MODEL as u32 + 255) / 256) as u32;
+
+            macro_rules! pre {
+                ($name:expr, $bufs:expr, $sizes:expr, $wg:expr) => {{
+                    let ds = engine.pre_allocate_desc_set($name, $bufs, $sizes);
+                    mega_dispatches.push(PrebuiltDispatch {
+                        pipeline_name: $name.to_string(), desc_set: ds, workgroups: $wg,
+                    });
+                }}
+            }
+
+            // 1. rmsnorm (attn)
+            pre!("rmsnorm", &[&gpu_hidden, &layer.attn_norm_buf, &gpu_normed], &[d4, d4, d4], [1,1,1]);
+            // 2. QKV matmul
+            pre!(layer.attn_qkv_type.shader_name(), &[&gpu_normed, &layer.attn_qkv_buf, &gpu_qkv],
+                &[layer.attn_qkv_k as u64*4, wb_qkv, layer.attn_qkv_n as u64*4],
+                [layer.attn_qkv_type.workgroups(layer.attn_qkv_n), 1, 1]);
+            // 3. RoPE
+            pre!("rope", &[&gpu_qkv, &gpu_rope_factors],
+                &[QKV_DIM as u64*4, (ROPE_DIM as u64/2)*4], [rope_wg, 1, 1]);
+            // 4. KV store (use max range — shader uses push pos to limit)
+            pre!("kv_store", &[&gpu_qkv, kb, vb],
+                &[QKV_DIM as u64*4, kv_max_bytes, kv_max_bytes], [kv_store_wg, 1, 1]);
+            // 5. Attention (use max KV range — shader uses push seq_len)
+            pre!("attention", &[&gpu_qkv, kb, vb, &attn_out_buf],
+                &[d4, kv_max_bytes, kv_max_bytes, d4], [N_HEADS as u32, 1, 1]);
+            // 6. Output projection
+            pre!(layer.attn_output_type.shader_name(), &[&attn_out_buf, &layer.attn_output_buf, &gpu_tmp],
+                &[layer.attn_output_k as u64*4, wb_out, layer.attn_output_n as u64*4],
+                [layer.attn_output_type.workgroups(layer.attn_output_n), 1, 1]);
+            // 7. Residual add (attn)
+            pre!("residual_add", &[&gpu_hidden, &gpu_tmp, &gpu_hidden], &[d4, d4, d4], [resid_wg, 1, 1]);
+            // 8. rmsnorm (FFN)
+            pre!("rmsnorm", &[&gpu_hidden, &layer.ffn_norm_buf, &gpu_normed], &[d4, d4, d4], [1,1,1]);
+            // 9. FFN up
+            pre!(layer.ffn_up_type.shader_name(), &[&gpu_normed, &layer.ffn_up_buf, &gpu_gate_up],
+                &[layer.ffn_up_k as u64*4, wb_up, layer.ffn_up_n as u64*4],
+                [layer.ffn_up_type.workgroups(layer.ffn_up_n), 1, 1]);
+            // 10. SiLU gate
+            pre!("silu_gate", &[&gpu_gate_up, &gpu_ffn_mid],
+                &[GATE_UP_DIM as u64*4, FFN_DIM as u64*4], [silu_wg, 1, 1]);
+            // 11. FFN down
+            pre!(layer.ffn_down_type.shader_name(), &[&gpu_ffn_mid, &layer.ffn_down_buf, &gpu_tmp],
+                &[layer.ffn_down_k as u64*4, wb_dn, layer.ffn_down_n as u64*4],
+                [layer.ffn_down_type.workgroups(layer.ffn_down_n), 1, 1]);
+            // 12. Residual add (FFN)
+            pre!("residual_add", &[&gpu_hidden, &gpu_tmp, &gpu_hidden], &[d4, d4, d4], [resid_wg, 1, 1]);
+        }
+
+        eprintln!("[phi4] Ready: {:.1}s, {:.1}MB total GPU ({} emb chunks, {} pre-built dispatches)",
             t0.elapsed().as_secs_f32(), total_gpu as f64 / 1e6, emb_bufs.len(),
-            engine.persistent_desc_sets.len());
+            mega_dispatches.len());
 
         Phi4Model { embedding, output_norm, layers, buf_a, buf_c, logits_buf, emb_bufs, rope_factors,
                     attn_q_buf, attn_out_buf, kv_bufs, logit_out_bufs,
-                    gpu_hidden, gpu_normed, gpu_qkv, gpu_gate_up, gpu_ffn_mid, gpu_tmp, gpu_rope_factors }
+                    gpu_hidden, gpu_normed, gpu_qkv, gpu_gate_up, gpu_ffn_mid, gpu_tmp, gpu_rope_factors,
+                    mega_dispatches }
     }
 
     /// Helper: build a K-quant matmul dispatch tuple for use with dispatch_batch.
@@ -477,21 +557,20 @@ impl Phi4Model {
         )
     }
 
-    /// Zero-CPU forward pass: hidden state stays on GPU for entire layer.
-    /// ONE command buffer submit per layer (11 dispatches with barriers).
-    /// CPU only does embedding upload at start, logit download at end.
+    /// Zero-CPU forward pass with pre-allocated descriptor sets.
+    /// 384 dispatches across 32 layers in ONE submit. Zero Vulkan allocations.
     pub unsafe fn forward_gpu(&self, engine: &ComputeEngine, hidden: &mut Vec<f32>, cache: &mut KVCache) -> Vec<f32> {
         assert_eq!(hidden.len(), D_MODEL);
         let pos = cache.len;
-        let heads_per_kv = N_HEADS / N_KV_HEADS;
         let d = D_MODEL as u32;
+        let heads_per_kv = N_HEADS / N_KV_HEADS;
         let kv_stride = (N_KV_HEADS * HEAD_DIM) as u32;
+        let seq_len = pos as u32 + 1;
 
-        // Upload hidden state to GPU once
         upload(&self.gpu_hidden, hidden);
 
+        // Build push constants (only thing that changes per token)
         let norm_push: Vec<u8> = [1u32, d].iter().flat_map(|v| v.to_le_bytes()).collect();
-        let seq_len = pos as u32 + 1;
         let rope_push: Vec<u8> = [pos as u32, N_HEADS as u32, N_KV_HEADS as u32, HEAD_DIM as u32, ROPE_DIM as u32]
             .iter().flat_map(|v| v.to_le_bytes()).collect();
         let kv_store_push: Vec<u8> = [pos as u32, (N_HEADS * HEAD_DIM) as u32, kv_stride]
@@ -501,78 +580,42 @@ impl Phi4Model {
         let attn_push: Vec<u8> = [seq_len, N_KV_HEADS as u32, heads_per_kv as u32]
             .iter().flat_map(|v| v.to_le_bytes()).collect();
 
-        let total_rope_pairs = (N_HEADS + N_KV_HEADS) * (ROPE_DIM / 2);
-        let rope_wg = ((total_rope_pairs + 63) / 64) as u32;
-        let kv_store_wg = ((kv_stride + 255) / 256) as u32;
-        let silu_wg = ((FFN_DIM as u32 + 255) / 256) as u32;
-        let resid_wg = ((d + 255) / 256) as u32;
-        let kv_bytes = seq_len as u64 * kv_stride as u64 * 4;
+        // Map dispatch index (0..11 within each layer) to push constants
+        // Order: rmsnorm, qkv, rope, kv_store, attn, out_proj, resid, rmsnorm, ffn_up, silu, ffn_down, resid
+        let push_map: [&[u8]; 12] = [
+            &norm_push, &[],  // qkv push filled per-layer
+            &rope_push, &kv_store_push, &attn_push,
+            &[],  // out_proj push filled per-layer
+            &resid_push, &norm_push,
+            &[],  // ffn_up push filled per-layer
+            &silu_push,
+            &[],  // ffn_down push filled per-layer
+            &resid_push,
+        ];
 
-        // Build ALL dispatches for ALL 32 layers into one mega-batch
-        let mut all_names: Vec<String> = Vec::with_capacity(12 * N_LAYERS);
-        let mut all_bufs: Vec<Vec<&GpuBuffer>> = Vec::with_capacity(12 * N_LAYERS);
-        let mut all_sizes: Vec<Vec<u64>> = Vec::with_capacity(12 * N_LAYERS);
-        let mut all_push: Vec<Vec<u8>> = Vec::with_capacity(12 * N_LAYERS);
-        let mut all_groups: Vec<[u32; 3]> = Vec::with_capacity(12 * N_LAYERS);
-
-        macro_rules! add {
-            ($name:expr, $bufs:expr, $sizes:expr, $push:expr, $groups:expr) => {
-                all_names.push($name.to_string());
-                all_bufs.push($bufs);
-                all_sizes.push($sizes);
-                all_push.push($push);
-                all_groups.push($groups);
-            }
+        // Build dispatch list from pre-allocated table + per-token push constants
+        let n = self.mega_dispatches.len();
+        let mut push_data: Vec<Vec<u8>> = Vec::with_capacity(n);
+        for (i, d) in self.mega_dispatches.iter().enumerate() {
+            let slot = i % 12;
+            let li = i / 12;
+            let layer = &self.layers[li];
+            let push = match slot {
+                1 => [layer.attn_qkv_k, layer.attn_qkv_n].iter().flat_map(|v| v.to_le_bytes()).collect(),
+                5 => [layer.attn_output_k, layer.attn_output_n].iter().flat_map(|v| v.to_le_bytes()).collect(),
+                8 => [layer.ffn_up_k, layer.ffn_up_n].iter().flat_map(|v| v.to_le_bytes()).collect(),
+                10 => [layer.ffn_down_k, layer.ffn_down_n].iter().flat_map(|v| v.to_le_bytes()).collect(),
+                _ => push_map[slot].to_vec(),
+            };
+            push_data.push(push);
         }
 
-        for (_li, layer) in self.layers.iter().enumerate() {
-            let (ref kbuf, ref vbuf) = self.kv_bufs[_li];
-            let bpr_qkv = layer.attn_qkv_k as u64 / 256;
-            let wb_qkv = layer.attn_qkv_n as u64 * bpr_qkv * layer.attn_qkv_type.block_bytes() as u64;
-            let bpr_out = layer.attn_output_k as u64 / 256;
-            let wb_out = layer.attn_output_n as u64 * bpr_out * layer.attn_output_type.block_bytes() as u64;
-            let bpr_up = layer.ffn_up_k as u64 / 256;
-            let wb_up = layer.ffn_up_n as u64 * bpr_up * layer.ffn_up_type.block_bytes() as u64;
-            let bpr_dn = layer.ffn_down_k as u64 / 256;
-            let wb_dn = layer.ffn_down_n as u64 * bpr_dn * layer.ffn_down_type.block_bytes() as u64;
-            let pb2 = |a: u32, b: u32| -> Vec<u8> { [a, b].iter().flat_map(|v| v.to_le_bytes()).collect() };
-
-            add!("rmsnorm", vec![&self.gpu_hidden, &layer.attn_norm_buf, &self.gpu_normed],
-                vec![d as u64*4; 3], norm_push.clone(), [1,1,1]);
-            add!(layer.attn_qkv_type.shader_name(), vec![&self.gpu_normed, &layer.attn_qkv_buf, &self.gpu_qkv],
-                vec![layer.attn_qkv_k as u64*4, wb_qkv, layer.attn_qkv_n as u64*4], pb2(layer.attn_qkv_k, layer.attn_qkv_n),
-                [layer.attn_qkv_type.workgroups(layer.attn_qkv_n), 1, 1]);
-            add!("rope", vec![&self.gpu_qkv, &self.gpu_rope_factors],
-                vec![QKV_DIM as u64*4, (ROPE_DIM as u64/2)*4], rope_push.clone(), [rope_wg,1,1]);
-            add!("kv_store", vec![&self.gpu_qkv, kbuf, vbuf],
-                vec![QKV_DIM as u64*4, kv_bytes, kv_bytes], kv_store_push.clone(), [kv_store_wg,1,1]);
-            add!("attention", vec![&self.gpu_qkv, kbuf, vbuf, &self.attn_out_buf],
-                vec![D_MODEL as u64*4, kv_bytes, kv_bytes, D_MODEL as u64*4], attn_push.clone(), [N_HEADS as u32,1,1]);
-            add!(layer.attn_output_type.shader_name(), vec![&self.attn_out_buf, &layer.attn_output_buf, &self.gpu_tmp],
-                vec![layer.attn_output_k as u64*4, wb_out, layer.attn_output_n as u64*4], pb2(layer.attn_output_k, layer.attn_output_n),
-                [layer.attn_output_type.workgroups(layer.attn_output_n), 1, 1]);
-            add!("residual_add", vec![&self.gpu_hidden, &self.gpu_tmp, &self.gpu_hidden],
-                vec![d as u64*4; 3], resid_push.clone(), [resid_wg,1,1]);
-            add!("rmsnorm", vec![&self.gpu_hidden, &layer.ffn_norm_buf, &self.gpu_normed],
-                vec![d as u64*4; 3], norm_push.clone(), [1,1,1]);
-            add!(layer.ffn_up_type.shader_name(), vec![&self.gpu_normed, &layer.ffn_up_buf, &self.gpu_gate_up],
-                vec![layer.ffn_up_k as u64*4, wb_up, layer.ffn_up_n as u64*4], pb2(layer.ffn_up_k, layer.ffn_up_n),
-                [layer.ffn_up_type.workgroups(layer.ffn_up_n), 1, 1]);
-            add!("silu_gate", vec![&self.gpu_gate_up, &self.gpu_ffn_mid],
-                vec![GATE_UP_DIM as u64*4, FFN_DIM as u64*4], silu_push.clone(), [silu_wg,1,1]);
-            add!(layer.ffn_down_type.shader_name(), vec![&self.gpu_ffn_mid, &layer.ffn_down_buf, &self.gpu_tmp],
-                vec![layer.ffn_down_k as u64*4, wb_dn, layer.ffn_down_n as u64*4], pb2(layer.ffn_down_k, layer.ffn_down_n),
-                [layer.ffn_down_type.workgroups(layer.ffn_down_n), 1, 1]);
-            add!("residual_add", vec![&self.gpu_hidden, &self.gpu_tmp, &self.gpu_hidden],
-                vec![d as u64*4; 3], resid_push.clone(), [resid_wg,1,1]);
-        }
-
-        // ALL 384 dispatches in ONE command buffer submit
-        let dispatch_refs: Vec<(&str, &[&GpuBuffer], &[u64], &[u8], [u32; 3])> = (0..all_names.len())
-            .map(|i| (all_names[i].as_str(), all_bufs[i].as_slice(), all_sizes[i].as_slice(),
-                      all_push[i].as_slice(), all_groups[i]))
+        let dispatches: Vec<(&str, DescSetHandle, &[u8], [u32; 3])> = self.mega_dispatches.iter()
+            .enumerate()
+            .map(|(i, d)| (d.pipeline_name.as_str(), d.desc_set, push_data[i].as_slice(), d.workgroups))
             .collect();
-        engine.dispatch_batch(&dispatch_refs);
+
+        engine.dispatch_batch_persistent(&dispatches, true);
 
         cache.len += 1;
 
