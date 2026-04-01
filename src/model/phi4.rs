@@ -28,6 +28,9 @@ impl QType {
     fn shader_name(&self) -> &str {
         match self { QType::Q4K => "matmul_q4k", QType::Q5K => "matmul_q5k", QType::Q6K => "matmul_q6k" }
     }
+    fn fused_shader_name(&self) -> &str {
+        match self { QType::Q4K => "fused_norm_matmul_q4k", QType::Q5K => "fused_norm_matmul_q5k", QType::Q6K => "fused_norm_matmul_q6k" }
+    }
     fn block_bytes(&self) -> usize {
         match self { QType::Q4K => 144, QType::Q5K => 176, QType::Q6K => 210 }
     }
@@ -282,7 +285,10 @@ impl Phi4Model {
         engine.get_pipeline("matmul_q6k", 3, 8);
         engine.get_pipeline("matmul_tiled", 3, 12);
         engine.get_pipeline("rmsnorm", 3, 8);
-        engine.get_pipeline("attention", 4, 12);  // 4 buffers, 3 push u32s
+        engine.get_pipeline("attention", 4, 12);
+        engine.get_pipeline("fused_norm_matmul_q4k", 4, 8);
+        engine.get_pipeline("fused_norm_matmul_q5k", 4, 8);
+        engine.get_pipeline("fused_norm_matmul_q6k", 4, 8);
 
         let mut layers = Vec::with_capacity(N_LAYERS);
         let mut total_gpu: u64 = 0;
@@ -415,11 +421,9 @@ impl Phi4Model {
             {
                 let bufs1: Vec<&GpuBuffer> = vec![&self.buf_a, &layer.attn_norm_buf, &self.buf_c];
                 let sizes1: Vec<u64> = vec![d as u64 * 4, d as u64 * 4, d as u64 * 4];
-                let bufs2: Vec<&GpuBuffer> = qkv_d.1;
-                let sizes2: Vec<u64> = qkv_d.2;
                 engine.dispatch_batch(&[
                     ("rmsnorm", &bufs1, &sizes1, &norm_push, [1, 1, 1]),
-                    (qkv_d.0.as_str(), &bufs2, &sizes2, &qkv_d.3, qkv_d.4),
+                    (qkv_d.0.as_str(), &qkv_d.1, &qkv_d.2, &qkv_d.3, qkv_d.4),
                 ]);
             }
             download(&self.buf_a, &mut qkv[..QKV_DIM]);
@@ -473,11 +477,9 @@ impl Phi4Model {
             {
                 let bufs1: Vec<&GpuBuffer> = vec![&self.buf_a, &layer.ffn_norm_buf, &self.buf_c];
                 let sizes1: Vec<u64> = vec![d as u64 * 4, d as u64 * 4, d as u64 * 4];
-                let bufs2: Vec<&GpuBuffer> = up_d.1;
-                let sizes2: Vec<u64> = up_d.2;
                 engine.dispatch_batch(&[
                     ("rmsnorm", &bufs1, &sizes1, &norm_push, [1, 1, 1]),
-                    (up_d.0.as_str(), &bufs2, &sizes2, &up_d.3, up_d.4),
+                    (up_d.0.as_str(), &up_d.1, &up_d.2, &up_d.3, up_d.4),
                 ]);
             }
             download(&self.buf_a, &mut gate_up);
@@ -560,10 +562,10 @@ impl Phi4Model {
         for (_li, layer) in self.layers.iter().enumerate() {
             let norm_push: Vec<u8> = [1u32, d].iter().flat_map(|v| v.to_le_bytes()).collect();
 
-            // For each token: rmsnorm+QKV (batched pair), RoPE, KV cache update
+            // For each token: rmsnorm+QKV (batched), RoPE, KV cache update
+            let norm_push: Vec<u8> = [1u32, d].iter().flat_map(|v| v.to_le_bytes()).collect();
             let mut qs: Vec<Vec<f32>> = Vec::with_capacity(m);
             for t in 0..m {
-                // Batch 1: rmsnorm → QKV
                 upload(&self.buf_a, &hiddens[t]);
                 let qkv_d = Self::kquant_dispatch(
                     &self.buf_c, &layer.attn_qkv_buf, &self.buf_a,
@@ -626,7 +628,7 @@ impl Phi4Model {
                 for i in 0..D_MODEL { hiddens[t][i] += tmp[i]; }
             }
 
-            // FFN for each token: rmsnorm+up → SiLU → down
+            // FFN for each token: rmsnorm+up (batched) → SiLU → down
             for t in 0..m {
                 upload(&self.buf_a, &hiddens[t]);
                 let up_d = Self::kquant_dispatch(
