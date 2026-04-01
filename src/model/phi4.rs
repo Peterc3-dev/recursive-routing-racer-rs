@@ -73,6 +73,8 @@ impl KVCache {
     }
 }
 
+const ROPE_ATTN_FACTOR: f32 = 1.190238;  // phi3.rope.scaling.attn_factor
+
 fn apply_rope(x: &mut [f32], pos: usize, n_heads: usize, rope_factors: &[f32]) {
     for h in 0..n_heads {
         let base = h * HEAD_DIM;
@@ -82,10 +84,13 @@ fn apply_rope(x: &mut [f32], pos: usize, n_heads: usize, rope_factors: &[f32]) {
             let freq = base_freq / factor;
             let angle = pos as f32 * freq;
             let (sin_t, cos_t) = angle.sin_cos();
+            // LongRoPE: scale rotated dims by attn_factor (magnitude scaling)
+            let cos_scaled = cos_t * ROPE_ATTN_FACTOR;
+            let sin_scaled = sin_t * ROPE_ATTN_FACTOR;
             let x0 = x[base + 2 * i];
             let x1 = x[base + 2 * i + 1];
-            x[base + 2 * i] = x0 * cos_t - x1 * sin_t;
-            x[base + 2 * i + 1] = x0 * sin_t + x1 * cos_t;
+            x[base + 2 * i] = x0 * cos_scaled - x1 * sin_scaled;
+            x[base + 2 * i + 1] = x0 * sin_scaled + x1 * cos_scaled;
         }
     }
 }
@@ -358,9 +363,33 @@ impl Phi4Model {
         for (li, layer) in self.layers.iter().enumerate() {
             gpu_rmsnorm(engine, &self.buf_a, &layer.attn_norm_buf, &self.buf_c, hidden, &mut norm);
 
+            // DEBUG: verify RMS norm for layer 0
+            if li == 0 && pos == 0 {
+                // CPU reference RMS norm
+                let n = hidden.len();
+                let mut sum_sq: f32 = 0.0;
+                for &v in hidden.iter() { sum_sq += v * v; }
+                let inv_rms = 1.0 / (sum_sq / n as f32 + 1e-5_f32).sqrt();
+                // Read norm weights from GPU buffer
+                let norm_weights = std::slice::from_raw_parts(
+                    layer.attn_norm_buf.mapped as *const f32, D_MODEL);
+                let mut cpu_norm = vec![0.0f32; D_MODEL];
+                for i in 0..D_MODEL { cpu_norm[i] = norm_weights[i] * hidden[i] * inv_rms; }
+                eprintln!("[dbg] CPU norm[:5] = {:?}", &cpu_norm[..5]);
+                eprintln!("[dbg] GPU norm[:5] = {:?}", &norm[..5]);
+                let norm_match = cpu_norm[..5].iter().zip(norm[..5].iter())
+                    .all(|(a, b)| (a - b).abs() < 0.001);
+                eprintln!("[dbg] RMS norm match: {}", norm_match);
+            }
+
             // QKV via native K-quant shader
             gpu_matmul_kquant(engine, &self.buf_a, &layer.attn_qkv_buf, &self.buf_c,
                 layer.attn_qkv_type, &norm, &mut qkv, layer.attn_qkv_k, layer.attn_qkv_n);
+
+            if li == 0 && pos == 0 {
+                let hn = |v: &[f32]| -> f32 { v.iter().map(|x| x*x).sum::<f32>().sqrt() };
+                eprintln!("[L0] after norm: norm={:.4} first5={:?}", hn(&norm), &norm[..5]);
+            }
 
             let q_end = N_HEADS * HEAD_DIM;
             let k_end = q_end + N_KV_HEADS * HEAD_DIM;
@@ -397,16 +426,74 @@ impl Phi4Model {
                 }
             }
 
+            if li == 0 && pos == 0 {
+                let hn = |v: &[f32]| -> f32 { v.iter().map(|x| x*x).sum::<f32>().sqrt() };
+                eprintln!("[L0] qkv norm={:.4} first5={:?}", hn(&qkv), &qkv[..5]);
+                eprintln!("[L0] attn_out norm={:.4} first5={:?}", hn(&attn_out), &attn_out[..5]);
+            }
+
             gpu_matmul_kquant(engine, &self.buf_a, &layer.attn_output_buf, &self.buf_c,
                 layer.attn_output_type, &attn_out, &mut tmp, layer.attn_output_k, layer.attn_output_n);
 
+            if li == 0 && pos == 0 {
+                let hn = |v: &[f32]| -> f32 { v.iter().map(|x| x*x).sum::<f32>().sqrt() };
+                eprintln!("[L0] output_proj norm={:.4} first5={:?}", hn(&tmp), &tmp[..5]);
+
+                // CPU Q4_K reference for output proj row 0
+                let raw = std::slice::from_raw_parts(
+                    layer.attn_output_buf.mapped as *const u8,
+                    layer.attn_output_buf.capacity as usize);
+                let bpr = layer.attn_output_k as usize / 256;
+                let mut row0 = vec![0.0f32; layer.attn_output_k as usize];
+                for bi in 0..bpr {
+                    let bo = bi * 144;
+                    let b = &raw[bo..bo+144];
+                    let d = half::f16::from_bits(u16::from_le_bytes([b[0], b[1]])).to_f32();
+                    let dmin = half::f16::from_bits(u16::from_le_bytes([b[2], b[3]])).to_f32();
+                    let sc = &b[4..16];
+                    let qs = &b[16..144];
+                    for sub in 0..8usize {
+                        let (sv, mv) = if sub < 4 {
+                            (sc[sub] as u32 & 0x3F, sc[sub+4] as u32 & 0x3F)
+                        } else {
+                            let i = sub - 4;
+                            ((sc[8+i] as u32 & 0x0F)|((sc[i] as u32>>6)<<4),
+                             (sc[8+i] as u32>>4)|((sc[4+i] as u32>>6)<<4))
+                        };
+                        let s = d * sv as f32;
+                        let m = dmin * mv as f32;
+                        let pair = sub / 2;
+                        for j in 0..32usize {
+                            let qb = qs[pair*32+j];
+                            let qi = if sub%2==0 { qb&0xF } else { (qb>>4)&0xF };
+                            let elem = bi*256+sub*32+j;
+                            if elem < row0.len() { row0[elem] = qi as f32 * s - m; }
+                        }
+                    }
+                }
+                let cpu_out0: f32 = attn_out.iter().zip(row0.iter()).map(|(&a,&b)| a*b).sum();
+                eprintln!("[L0] Q4K output_proj: CPU[0]={:.6} GPU[0]={:.6} match={}",
+                    cpu_out0, tmp[0], (cpu_out0 - tmp[0]).abs() < 0.01);
+            }
+
             elemwise_add(hidden, &tmp, &mut norm);
             hidden.copy_from_slice(&norm);
+
+            if li == 0 && pos == 0 {
+                let hn = |v: &[f32]| -> f32 { v.iter().map(|x| x*x).sum::<f32>().sqrt() };
+                eprintln!("[L0] after attn residual norm={:.4}", hn(hidden));
+            }
 
             gpu_rmsnorm(engine, &self.buf_a, &layer.ffn_norm_buf, &self.buf_c, hidden, &mut norm);
 
             gpu_matmul_kquant(engine, &self.buf_a, &layer.ffn_up_buf, &self.buf_c,
                 layer.ffn_up_type, &norm, &mut gate_up, layer.ffn_up_k, layer.ffn_up_n);
+
+            if li == 0 && pos == 0 {
+                let hn = |v: &[f32]| -> f32 { v.iter().map(|x| x*x).sum::<f32>().sqrt() };
+                eprintln!("[L0] gate_up norm={:.4} gate[:3]={:?} up[:3]={:?}",
+                    hn(&gate_up), &gate_up[..3], &gate_up[FFN_DIM..FFN_DIM+3]);
+            }
 
             let (gate, up) = gate_up.split_at_mut(FFN_DIM);
             cpu_silu(gate);
@@ -415,11 +502,21 @@ impl Phi4Model {
             gpu_matmul_kquant(engine, &self.buf_a, &layer.ffn_down_buf, &self.buf_c,
                 layer.ffn_down_type, &ffn_mid, &mut tmp, layer.ffn_down_k, layer.ffn_down_n);
 
+            if li == 0 && pos == 0 {
+                let hn = |v: &[f32]| -> f32 { v.iter().map(|x| x*x).sum::<f32>().sqrt() };
+                eprintln!("[L0] ffn_down norm={:.4} first5={:?}", hn(&tmp), &tmp[..5]);
+            }
+
             elemwise_add(hidden, &tmp, &mut norm);
             hidden.copy_from_slice(&norm);
 
-            if li == 0 || li % 8 == 7 || li == N_LAYERS - 1 {
-                eprintln!("[fwd] layer {}/31", li);
+            if li == 0 && pos == 0 {
+                let hn = |v: &[f32]| -> f32 { v.iter().map(|x| x*x).sum::<f32>().sqrt() };
+                eprintln!("[L0] FINAL hidden norm={:.4} first5={:?}", hn(hidden), &hidden[..5]);
+            }
+            {
+                let hn: f32 = hidden.iter().map(|x| x*x).sum::<f32>().sqrt();
+                eprintln!("[fwd] layer {}/31 hidden_norm={:.2}", li, hn);
             }
         }
 
