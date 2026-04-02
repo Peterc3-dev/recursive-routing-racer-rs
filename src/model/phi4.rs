@@ -499,7 +499,8 @@ impl Phi4Model {
         engine.get_pipeline("matmul_gpuq4", 3, 8);
         engine.get_pipeline("matmul_gpuq5", 3, 8);
         engine.get_pipeline("matmul_gpuq6", 3, 8);
-        engine.get_pipeline("rope", 2, 20);          // 5 push u32s = 20 bytes
+        engine.get_pipeline("rope", 2, 20);
+        engine.get_pipeline("rope_kv_store", 4, 28);  // 7 push u32s          // 5 push u32s = 20 bytes
         engine.get_pipeline("silu_gate", 2, 4);      // 1 push u32
         engine.get_pipeline("residual_add", 3, 4);   // 1 push u32
         engine.get_pipeline("kv_store", 3, 12);      // 3 push u32s
@@ -679,49 +680,47 @@ impl Phi4Model {
             let resid_wg = ((D_MODEL as u32 + 255) / 256) as u32;
 
             macro_rules! pre {
-                ($name:expr, $bufs:expr, $sizes:expr, $wg:expr) => {{
+                ($name:expr, $bufs:expr, $sizes:expr, $wg:expr) => {
+                    pre!($name, $bufs, $sizes, $wg, true)
+                };
+                ($name:expr, $bufs:expr, $sizes:expr, $wg:expr, $barrier:expr) => {{
                     let ds = engine.pre_allocate_desc_set($name, $bufs, $sizes);
                     mega_dispatches.push(PrebuiltDispatch {
-                        pipeline_name: $name.to_string(), desc_set: ds, workgroups: $wg, needs_barrier: true,
+                        pipeline_name: $name.to_string(), desc_set: ds, workgroups: $wg, needs_barrier: $barrier,
                     });
                 }}
             }
 
-            // 1. rmsnorm (attn)
+            // All barriers required for correctness on RADV (L2 not implicitly coherent
+            // between dispatches). Tested: removing any barrier corrupts output.
             pre!("rmsnorm", &[&gpu_hidden, &layer.attn_norm_buf, &gpu_normed], &[d4, d4, d4], [1,1,1]);
-            // 2. QKV matmul
             pre!(layer.attn_qkv_type.shader_name(), &[&gpu_normed, &layer.attn_qkv_buf, &gpu_qkv],
                 &[layer.attn_qkv_k as u64*4, wb_qkv, layer.attn_qkv_n as u64*4],
                 [layer.attn_qkv_type.workgroups(layer.attn_qkv_n), 1, 1]);
-            // 3. RoPE
-            pre!("rope", &[&gpu_qkv, &gpu_rope_factors],
-                &[QKV_DIM as u64*4, (ROPE_DIM as u64/2)*4], [rope_wg, 1, 1]);
-            // 4. KV store (use max range — shader uses push pos to limit)
-            pre!("kv_store", &[&gpu_qkv, kb, vb],
-                &[QKV_DIM as u64*4, kv_max_bytes, kv_max_bytes], [kv_store_wg, 1, 1]);
-            // 5. Attention (use max KV range — shader uses push seq_len)
+            // Fused RoPE + KV store (eliminates one dispatch + one barrier)
+            let fused_wg = {
+                let rope_pairs = (N_HEADS + N_KV_HEADS) * (ROPE_DIM / 2);
+                let half_kv = N_KV_HEADS * HEAD_DIM / 2;
+                let max_threads = std::cmp::max(rope_pairs, half_kv);
+                ((max_threads + 63) / 64) as u32
+            };
+            pre!("rope_kv_store", &[&gpu_qkv, &gpu_rope_factors, kb, vb],
+                &[QKV_DIM as u64*4, (ROPE_DIM as u64/2)*4, kv_max_bytes, kv_max_bytes], [fused_wg, 1, 1]);
             pre!("attention", &[&gpu_qkv, kb, vb, &attn_out_buf],
                 &[d4, kv_max_bytes, kv_max_bytes, d4], [N_HEADS as u32, 1, 1]);
-            // 6. Output projection
             pre!(layer.attn_output_type.shader_name(), &[&attn_out_buf, &layer.attn_output_buf, &gpu_tmp],
                 &[layer.attn_output_k as u64*4, wb_out, layer.attn_output_n as u64*4],
                 [layer.attn_output_type.workgroups(layer.attn_output_n), 1, 1]);
-            // 7. Residual add (attn)
             pre!("residual_add", &[&gpu_hidden, &gpu_tmp, &gpu_hidden], &[d4, d4, d4], [resid_wg, 1, 1]);
-            // 8. rmsnorm (FFN)
             pre!("rmsnorm", &[&gpu_hidden, &layer.ffn_norm_buf, &gpu_normed], &[d4, d4, d4], [1,1,1]);
-            // 9. FFN up
             pre!(layer.ffn_up_type.shader_name(), &[&gpu_normed, &layer.ffn_up_buf, &gpu_gate_up],
                 &[layer.ffn_up_k as u64*4, wb_up, layer.ffn_up_n as u64*4],
                 [layer.ffn_up_type.workgroups(layer.ffn_up_n), 1, 1]);
-            // 10. SiLU gate
             pre!("silu_gate", &[&gpu_gate_up, &gpu_ffn_mid],
                 &[GATE_UP_DIM as u64*4, FFN_DIM as u64*4], [silu_wg, 1, 1]);
-            // 11. FFN down
             pre!(layer.ffn_down_type.shader_name(), &[&gpu_ffn_mid, &layer.ffn_down_buf, &gpu_tmp],
                 &[layer.ffn_down_k as u64*4, wb_dn, layer.ffn_down_n as u64*4],
                 [layer.ffn_down_type.workgroups(layer.ffn_down_n), 1, 1]);
-            // 12. Residual add (FFN)
             pre!("residual_add", &[&gpu_hidden, &gpu_tmp, &gpu_hidden], &[d4, d4, d4], [resid_wg, 1, 1]);
         }
 
@@ -798,43 +797,41 @@ impl Phi4Model {
 
         // Build push constants (only thing that changes per token)
         let norm_push: Vec<u8> = [1u32, d].iter().flat_map(|v| v.to_le_bytes()).collect();
-        let rope_push: Vec<u8> = [pos as u32, N_HEADS as u32, N_KV_HEADS as u32, HEAD_DIM as u32, ROPE_DIM as u32]
-            .iter().flat_map(|v| v.to_le_bytes()).collect();
-        let kv_store_push: Vec<u8> = [pos as u32, (N_HEADS * HEAD_DIM) as u32, kv_stride]
+        let rope_kv_push: Vec<u8> = [pos as u32, N_HEADS as u32, N_KV_HEADS as u32, HEAD_DIM as u32, ROPE_DIM as u32,
+            (N_HEADS * HEAD_DIM) as u32, (N_KV_HEADS * HEAD_DIM) as u32]
             .iter().flat_map(|v| v.to_le_bytes()).collect();
         let silu_push: Vec<u8> = [FFN_DIM as u32].iter().flat_map(|v| v.to_le_bytes()).collect();
         let resid_push: Vec<u8> = [d].iter().flat_map(|v| v.to_le_bytes()).collect();
         let attn_push: Vec<u8> = [seq_len, N_KV_HEADS as u32, heads_per_kv as u32]
             .iter().flat_map(|v| v.to_le_bytes()).collect();
 
-        // Map dispatch index (0..11 within each layer) to push constants
-        // Order: rmsnorm, qkv, rope, kv_store, attn, out_proj, resid, rmsnorm, ffn_up, silu, ffn_down, resid
-        let push_map: [&[u8]; 12] = [
-            &norm_push, &[],  // qkv push filled per-layer
-            &rope_push, &kv_store_push, &attn_push,
-            &[],  // out_proj push filled per-layer
+        // 11 dispatches per layer: rmsnorm, qkv, rope_kv_store, attn, out_proj, resid, rmsnorm, ffn_up, silu, ffn_down, resid
+        let dispatches_per_layer = 11usize;
+        let push_map: [&[u8]; 11] = [
+            &norm_push, &[],  // qkv
+            &rope_kv_push, &attn_push,
+            &[],  // out_proj
             &resid_push, &norm_push,
-            &[],  // ffn_up push filled per-layer
+            &[],  // ffn_up
             &silu_push,
-            &[],  // ffn_down push filled per-layer
+            &[],  // ffn_down
             &resid_push,
         ];
 
-        // Build push constants for ALL dispatches (layers + output norm + logit chunks)
-        let n_layer_dispatches = 12 * N_LAYERS;
+        // Build push constants for ALL dispatches
+        let n_layer_dispatches = dispatches_per_layer * N_LAYERS;
         let n_total = self.mega_dispatches.len();
         let mut push_data: Vec<Vec<u8>> = Vec::with_capacity(n_total);
 
-        // Layer dispatches (0..384)
         for i in 0..n_layer_dispatches {
-            let slot = i % 12;
-            let li = i / 12;
+            let slot = i % dispatches_per_layer;
+            let li = i / dispatches_per_layer;
             let layer = &self.layers[li];
             let push = match slot {
                 1 => [layer.attn_qkv_k, layer.attn_qkv_n].iter().flat_map(|v| v.to_le_bytes()).collect(),
-                5 => [layer.attn_output_k, layer.attn_output_n].iter().flat_map(|v| v.to_le_bytes()).collect(),
-                8 => [layer.ffn_up_k, layer.ffn_up_n].iter().flat_map(|v| v.to_le_bytes()).collect(),
-                10 => [layer.ffn_down_k, layer.ffn_down_n].iter().flat_map(|v| v.to_le_bytes()).collect(),
+                4 => [layer.attn_output_k, layer.attn_output_n].iter().flat_map(|v| v.to_le_bytes()).collect(),
+                7 => [layer.ffn_up_k, layer.ffn_up_n].iter().flat_map(|v| v.to_le_bytes()).collect(),
+                9 => [layer.ffn_down_k, layer.ffn_down_n].iter().flat_map(|v| v.to_le_bytes()).collect(),
                 _ => push_map[slot].to_vec(),
             };
             push_data.push(push);
