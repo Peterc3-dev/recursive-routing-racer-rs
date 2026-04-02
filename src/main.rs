@@ -3,19 +3,27 @@ mod model;
 use std::io::Write;
 use std::time::Instant;
 
-const GGUF_PATH: &str = "/home/raz/.lmstudio/models/lmstudio-community/Phi-4-mini-reasoning-GGUF/Phi-4-mini-reasoning-Q4_K_M.gguf";
+const DEFAULT_GGUF: &str = "/home/raz/.lmstudio/models/lmstudio-community/Phi-4-mini-reasoning-GGUF/Phi-4-mini-reasoning-Q4_K_M.gguf";
 const SHADER_DIR: &str = "/home/raz/projects/torch-vulkan/csrc/shaders";
 
 const MAX_TOKENS: usize = 256;
 const EOS_TOKEN: u32 = 199999;  // <|endoftext|> for Phi-4
 
 fn main() {
-    let batch = std::env::args().any(|a| a == "--batch");
-    let speculative = std::env::args().any(|a| a == "--speculative");
+    let args: Vec<String> = std::env::args().collect();
+    let batch = args.iter().any(|a| a == "--batch");
+    let speculative = args.iter().any(|a| a == "--speculative");
     let draft_layers: usize = 8;
     let draft_k: usize = 4;
 
-    let gguf = model::GGUFModel::load(GGUF_PATH);
+    // Model path: first non-flag argument, or default
+    let gguf_path = args.iter().skip(1)
+        .find(|a| !a.starts_with("--"))
+        .map(|s| s.as_str())
+        .unwrap_or(DEFAULT_GGUF);
+
+    eprintln!("[rrr] Loading {}", gguf_path);
+    let gguf = model::GGUFModel::load(gguf_path);
     let tokenizer = model::BPETokenizer::from_gguf(&gguf);
 
     unsafe {
@@ -33,7 +41,11 @@ fn main() {
             let mut cache = model::KVCache::new();
 
             let pt = Instant::now();
-            let mut logits = phi4.forward_prefill_batched(&engine, &prompt_tokens, &mut cache);
+            let mut logits = Vec::new();
+            for &tok in &prompt_tokens {
+                let mut h = phi4.embed(tok);
+                logits = phi4.forward_gpu(&engine, &mut h, &mut cache);
+            }
             eprintln!("[prefill {}ms, {} tokens]", pt.elapsed().as_millis(), prompt_tokens.len());
 
             let gt = Instant::now();

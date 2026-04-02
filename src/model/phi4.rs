@@ -231,24 +231,35 @@ impl KVCache {
     }
 }
 
-fn apply_rope(x: &mut [f32], pos: usize, n_heads: usize, rope_factors: &[f32]) {
+fn apply_rope_cfg(x: &mut [f32], pos: usize, n_heads: usize, cfg: &ModelConfig, rope_factors: &[f32]) {
     for h in 0..n_heads {
-        let base = h * HEAD_DIM;
-        for i in 0..(ROPE_DIM / 2) {
-            let base_freq = 1.0 / ROPE_THETA.powf(2.0 * i as f32 / ROPE_DIM as f32);
+        let base = h * cfg.head_dim;
+        for i in 0..(cfg.rope_dim / 2) {
+            let base_freq = 1.0 / cfg.rope_theta.powf(2.0 * i as f32 / cfg.rope_dim as f32);
             let factor = if i < rope_factors.len() { rope_factors[i] } else { 1.0 };
             let freq = base_freq / factor;
             let angle = pos as f32 * freq;
             let (sin_t, cos_t) = angle.sin_cos();
-            // LongRoPE: scale rotated dims by attn_factor (magnitude scaling)
-            let cos_scaled = cos_t * ROPE_ATTN_FACTOR;
-            let sin_scaled = sin_t * ROPE_ATTN_FACTOR;
+            let cos_scaled = cos_t * cfg.rope_attn_factor;
+            let sin_scaled = sin_t * cfg.rope_attn_factor;
             let x0 = x[base + 2 * i];
             let x1 = x[base + 2 * i + 1];
             x[base + 2 * i] = x0 * cos_scaled - x1 * sin_scaled;
             x[base + 2 * i + 1] = x0 * sin_scaled + x1 * cos_scaled;
         }
     }
+}
+
+// Compat wrapper using legacy constants
+fn apply_rope(x: &mut [f32], pos: usize, n_heads: usize, rope_factors: &[f32]) {
+    let cfg = ModelConfig {
+        arch: "phi3".into(), d_model: D_MODEL, n_heads: N_HEADS, n_kv_heads: N_KV_HEADS,
+        head_dim: HEAD_DIM, ffn_dim: FFN_DIM, n_layers: N_LAYERS, vocab_size: VOCAB_SIZE,
+        rms_eps: RMS_EPS, rope_dim: ROPE_DIM, rope_theta: ROPE_THETA,
+        rope_attn_factor: ROPE_ATTN_FACTOR, has_qkv_bias: false, has_rope_factors: true,
+        separate_qkv: false, separate_gate_up: false, has_output_weight: false,
+    };
+    apply_rope_cfg(x, pos, n_heads, &cfg, rope_factors);
 }
 
 // ============================================================================
@@ -463,13 +474,79 @@ fn dequant_q6_k(data: &[u8], n_elements: usize) -> Vec<f32> {
     out
 }
 
+fn dequant_q4_k(data: &[u8], n_elements: usize) -> Vec<f32> {
+    let n_blocks = n_elements / 256;
+    let mut out = vec![0.0f32; n_elements];
+    for bi in 0..n_blocks {
+        let b = &data[bi * 144..];
+        let d = f16_to_f32(u16::from_le_bytes([b[0], b[1]]));
+        let dmin = f16_to_f32(u16::from_le_bytes([b[2], b[3]]));
+        let sc = &b[4..16];
+        let qs = &b[16..144];
+        let base = bi * 256;
+        for sub in 0..8usize {
+            let (sv, mv) = if sub < 4 {
+                (sc[sub] as u32 & 0x3F, sc[sub+4] as u32 & 0x3F)
+            } else {
+                let i = sub - 4;
+                ((sc[8+i] as u32 & 0x0F)|((sc[i] as u32>>6)<<4),
+                 (sc[8+i] as u32>>4)|((sc[4+i] as u32>>6)<<4))
+            };
+            let s = d * sv as f32;
+            let m = dmin * mv as f32;
+            let pair = sub / 2;
+            for j in 0..32usize {
+                let qb = qs[pair*32+j];
+                let qi = if sub%2==0 { qb&0xF } else { (qb>>4)&0xF };
+                out[base+sub*32+j] = qi as f32 * s - m;
+            }
+        }
+    }
+    out
+}
+
+fn dequant_q5_k(data: &[u8], n_elements: usize) -> Vec<f32> {
+    let n_blocks = n_elements / 256;
+    let mut out = vec![0.0f32; n_elements];
+    for bi in 0..n_blocks {
+        let b = &data[bi * 176..];
+        let d = f16_to_f32(u16::from_le_bytes([b[0], b[1]]));
+        let dmin = f16_to_f32(u16::from_le_bytes([b[2], b[3]]));
+        let sc = &b[4..16]; let qh = &b[16..48]; let qs = &b[48..176];
+        let base = bi * 256;
+        for sub in 0..8usize {
+            let (sv, mv) = if sub < 4 {
+                (sc[sub] as u32 & 0x3F, sc[sub+4] as u32 & 0x3F)
+            } else {
+                let i = sub - 4;
+                ((sc[8+i] as u32 & 0x0F)|((sc[i] as u32>>6)<<4),
+                 (sc[8+i] as u32>>4)|((sc[4+i] as u32>>6)<<4))
+            };
+            let s = d * sv as f32;
+            let m = dmin * mv as f32;
+            let pair = sub / 2;
+            for j in 0..32usize {
+                let qb = qs[pair*32+j];
+                let qi_lo = if sub%2==0 { qb&0xF } else { (qb>>4)&0xF };
+                let qh_bit = (qh[j] >> sub) & 1;
+                let qi = qi_lo as u32 | ((qh_bit as u32) << 4);
+                out[base+sub*32+j] = qi as f32 * s - m;
+            }
+        }
+    }
+    out
+}
+
 fn dequant_tensor_f32(gguf: &GGUFModel, name: &str) -> Vec<f32> {
-    let info = gguf.tensor_infos.iter().find(|t| t.name == name).unwrap();
+    let info = gguf.tensor_infos.iter().find(|t| t.name == name)
+        .unwrap_or_else(|| panic!("Tensor not found: {}", name));
     let n_elements: usize = info.shape.iter().product::<u64>() as usize;
     let bytes = gguf.tensor_bytes(name);
     match info.typ {
         0 => unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const f32, n_elements).to_vec() },
         1 => unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const u16, n_elements).iter().map(|&b| f16_to_f32(b)).collect() },
+        12 => dequant_q4_k(bytes, n_elements),
+        13 => dequant_q5_k(bytes, n_elements),
         14 => dequant_q6_k(bytes, n_elements),
         t => panic!("dequant_tensor_f32: unsupported type {} for {}", t, name),
     }
@@ -621,100 +698,163 @@ impl Phi4Model {
         engine.get_pipeline("residual_add", 3, 4);   // 1 push u32
         engine.get_pipeline("kv_store", 3, 12);      // 3 push u32s
 
-        let mut layers = Vec::with_capacity(N_LAYERS);
+        let mut layers = Vec::with_capacity(config.n_layers);
         let mut total_gpu: u64 = 0;
 
-        for i in 0..N_LAYERS {
+        // Helper: load a weight tensor, repack to GPU-native format
+        fn load_weight_gpu(gguf: &GGUFModel, engine: &ComputeEngine, name: &str, total: &mut u64) -> (GpuBuffer, QType, u32, u32) {
+            let info = gguf.tensor_infos.iter().find(|t| t.name == name)
+                .unwrap_or_else(|| panic!("Tensor not found: {}", name));
+            let gguf_qtype = QType::from_gguf(info.typ);
+            let ne0 = info.shape[0] as u32;
+            let ne1 = info.shape[1] as u32;
+            let raw_bytes = gguf.tensor_bytes(name);
+            let n_elements = ne0 as usize * ne1 as usize;
+            let (data, qtype) = match gguf_qtype {
+                QType::Q4K => (repack_q4k(raw_bytes, n_elements), QType::GPUQ4),
+                QType::Q5K => (repack_q5k(raw_bytes, n_elements), QType::GPUQ5),
+                QType::Q6K => (repack_q6k(raw_bytes, n_elements), QType::GPUQ6),
+                _ => (raw_bytes.to_vec(), gguf_qtype),
+            };
+            let buf = unsafe { engine.alloc_buffer(data.len() as u64) };
+            unsafe { upload_bytes(&buf, &data) };
+            *total += data.len() as u64;
+            (buf, qtype, ne0, ne1)
+        }
+
+        // Helper: try to load a tensor, return None if it doesn't exist
+        fn try_load_weight(gguf: &GGUFModel, engine: &ComputeEngine, name: &str, total: &mut u64) -> Option<(GpuBuffer, QType, u32, u32)> {
+            if gguf.tensor_infos.iter().any(|t| t.name == name) {
+                Some(load_weight_gpu(gguf, engine, name, total))
+            } else { None }
+        }
+
+        for i in 0..config.n_layers {
             let prefix = format!("blk.{}", i);
 
-            // Upload weights to GPU — repack Q4_K to GPU-native format
-            let mut load_weight = |name: &str| -> (GpuBuffer, QType, u32, u32) {
-                let info = gguf.tensor_infos.iter().find(|t| t.name == name).unwrap();
-                let gguf_qtype = QType::from_gguf(info.typ);
-                let ne0 = info.shape[0] as u32;
-                let ne1 = info.shape[1] as u32;
-                let raw_bytes = gguf.tensor_bytes(name);
+            // QKV weights: combined (Phi-4) or separate Q+K+V (Qwen2)
+            let (qkv_buf, qkv_t, qkv_k, qkv_n, qkv_bias);
+            if config.separate_qkv {
+                // Separate Q, K, V — load each, keep Q as the "QKV" for norm→Q matmul
+                // K and V stored separately for individual matmul dispatches
+                let (q_buf, q_t, q_k, q_n) = load_weight_gpu(gguf, engine, &format!("{}.attn_q.weight", prefix), &mut total_gpu);
+                qkv_buf = q_buf; qkv_t = q_t; qkv_k = q_k; qkv_n = q_n;
 
-                let n_elements = ne0 as usize * ne1 as usize;
-                let (data, qtype) = match gguf_qtype {
-                    QType::Q4K => (repack_q4k(raw_bytes, n_elements), QType::GPUQ4),
-                    QType::Q5K => (repack_q5k(raw_bytes, n_elements), QType::GPUQ5),
-                    QType::Q6K => (repack_q6k(raw_bytes, n_elements), QType::GPUQ6),
-                    _ => (raw_bytes.to_vec(), gguf_qtype),
-                };
+                // Load biases if present
+                qkv_bias = if config.has_qkv_bias {
+                    let qb = dequant_tensor_f32(gguf, &format!("{}.attn_q.bias", prefix));
+                    let kb = dequant_tensor_f32(gguf, &format!("{}.attn_k.bias", prefix));
+                    let vb = dequant_tensor_f32(gguf, &format!("{}.attn_v.bias", prefix));
+                    let mut combined = qb; combined.extend_from_slice(&kb); combined.extend_from_slice(&vb);
+                    Some(combined)
+                } else { None };
+            } else {
+                // Combined QKV (Phi-4 style)
+                let loaded = load_weight_gpu(gguf, engine, &format!("{}.attn_qkv.weight", prefix), &mut total_gpu);
+                qkv_buf = loaded.0; qkv_t = loaded.1; qkv_k = loaded.2; qkv_n = loaded.3;
+                qkv_bias = None;
+            }
 
-                let buf = engine.alloc_buffer(data.len() as u64);
-                upload_bytes(&buf, &data);
-                total_gpu += data.len() as u64;
-                (buf, qtype, ne0, ne1)
-            };
+            // K and V separate buffers (Qwen2 only)
+            let attn_k = if config.separate_qkv {
+                Some(load_weight_gpu(gguf, engine, &format!("{}.attn_k.weight", prefix), &mut total_gpu))
+            } else { None };
+            let attn_v = if config.separate_qkv {
+                Some(load_weight_gpu(gguf, engine, &format!("{}.attn_v.weight", prefix), &mut total_gpu))
+            } else { None };
 
-            let (qkv_buf, qkv_t, qkv_k, qkv_n) = load_weight(&format!("{}.attn_qkv.weight", prefix));
-            let (out_buf, out_t, out_k, out_n) = load_weight(&format!("{}.attn_output.weight", prefix));
-            let (up_buf, up_t, up_k, up_n) = load_weight(&format!("{}.ffn_up.weight", prefix));
-            let (down_buf, down_t, down_k, down_n) = load_weight(&format!("{}.ffn_down.weight", prefix));
+            let (out_buf, out_t, out_k, out_n) = load_weight_gpu(gguf, engine, &format!("{}.attn_output.weight", prefix), &mut total_gpu);
+
+            // FFN weights: combined gate+up (Phi-4) or separate (Qwen2)
+            let (up_buf, up_t, up_k, up_n);
+            let ffn_gate;
+            if config.separate_gate_up {
+                let gate = load_weight_gpu(gguf, engine, &format!("{}.ffn_gate.weight", prefix), &mut total_gpu);
+                let up = load_weight_gpu(gguf, engine, &format!("{}.ffn_up.weight", prefix), &mut total_gpu);
+                // Store gate as the "up" (first half of SwiGLU), up as separate
+                // The forward pass will dispatch gate and up separately then combine
+                up_buf = gate.0; up_t = gate.1; up_k = gate.2; up_n = gate.3;
+                ffn_gate = Some((up.0, up.1, up.2, up.3));
+            } else {
+                let loaded = load_weight_gpu(gguf, engine, &format!("{}.ffn_up.weight", prefix), &mut total_gpu);
+                up_buf = loaded.0; up_t = loaded.1; up_k = loaded.2; up_n = loaded.3;
+                ffn_gate = None;
+            }
+
+            let (down_buf, down_t, down_k, down_n) = load_weight_gpu(gguf, engine, &format!("{}.ffn_down.weight", prefix), &mut total_gpu);
 
             let attn_norm = dequant_tensor_f32(gguf, &format!("{}.attn_norm.weight", prefix));
-            let attn_norm_buf = engine.alloc_buffer(D_MODEL as u64 * 4);
+            let attn_norm_buf = engine.alloc_buffer(config.d_model as u64 * 4);
             upload(&attn_norm_buf, &attn_norm);
             let ffn_norm = dequant_tensor_f32(gguf, &format!("{}.ffn_norm.weight", prefix));
-            let ffn_norm_buf = engine.alloc_buffer(D_MODEL as u64 * 4);
+            let ffn_norm_buf = engine.alloc_buffer(config.d_model as u64 * 4);
             upload(&ffn_norm_buf, &ffn_norm);
 
-            // Push with placeholder desc set handles (will be filled after buf_a/buf_c are allocated)
             layers.push(LayerWeights {
                 attn_norm_buf, ffn_norm_buf,
                 attn_qkv_buf: qkv_buf, attn_qkv_type: qkv_t, attn_qkv_k: qkv_k, attn_qkv_n: qkv_n,
-                attn_k_buf: None, attn_v_buf: None,
+                attn_k_buf: attn_k, attn_v_buf: attn_v,
                 attn_output_buf: out_buf, attn_output_type: out_t, attn_output_k: out_k, attn_output_n: out_n,
                 ffn_up_buf: up_buf, ffn_up_type: up_t, ffn_up_k: up_k, ffn_up_n: up_n,
-                ffn_gate_buf: None,
+                ffn_gate_buf: ffn_gate,
                 ffn_down_buf: down_buf, ffn_down_type: down_t, ffn_down_k: down_k, ffn_down_n: down_n,
-                qkv_bias: None,
+                qkv_bias: qkv_bias,
                 ds_norm_qkv: (DescSetHandle(0), DescSetHandle(0)),
                 ds_out_proj: DescSetHandle(0),
                 ds_norm_ffnup: (DescSetHandle(0), DescSetHandle(0)),
                 ds_ffn_down: DescSetHandle(0),
             });
 
-            if i % 8 == 7 || i == N_LAYERS - 1 {
-                eprintln!("[phi4] Layer {}: {:.1}s ({:.1}MB GPU)", i, t0.elapsed().as_secs_f32(), total_gpu as f64 / 1e6);
+            if i % 8 == 7 || i == config.n_layers - 1 {
+                eprintln!("[load] Layer {}: {:.1}s ({:.1}MB GPU)", i, t0.elapsed().as_secs_f32(), total_gpu as f64 / 1e6);
             }
         }
 
-        let buf_a = engine.alloc_buffer((GATE_UP_DIM as u64) * 4);
-        let buf_c = engine.alloc_buffer((GATE_UP_DIM as u64) * 4);
+        let gate_up_dim = config.gate_up_dim();
+        let buf_a = engine.alloc_buffer((gate_up_dim as u64) * 4);
+        let buf_c = engine.alloc_buffer((gate_up_dim as u64) * 4);
         let logits_buf = engine.alloc_buffer(8192 * 4);
 
+        // For logit projection: use output.weight if available, else use embedding (tied weights)
+        let output_weight = if config.has_output_weight {
+            eprintln!("[load] Loading separate output.weight...");
+            dequant_tensor_f32(gguf, "output.weight")
+        } else {
+            embedding.clone()  // tied weights
+        };
+
         // F32 embedding chunks for logits (need transpose for matmul_tiled)
+        let d_model = config.d_model;
+        let vocab_size = config.vocab_size;
         let chunk_size: usize = 8192;
         let mut emb_bufs = Vec::new();
         let mut chunk_start = 0usize;
-        while chunk_start < VOCAB_SIZE {
-            let chunk_end = (chunk_start + chunk_size).min(VOCAB_SIZE);
+        while chunk_start < vocab_size {
+            let chunk_end = (chunk_start + chunk_size).min(vocab_size);
             let n = chunk_end - chunk_start;
-            let mut transposed = vec![0.0f32; D_MODEL * n];
-            for d in 0..D_MODEL {
+            let mut transposed = vec![0.0f32; d_model * n];
+            for d in 0..d_model {
                 for v in 0..n {
-                    transposed[d * n + v] = embedding[(chunk_start + v) * D_MODEL + d];
+                    transposed[d * n + v] = output_weight[(chunk_start + v) * d_model + d];
                 }
             }
-            let buf = engine.alloc_buffer((D_MODEL * n) as u64 * 4);
+            let buf = engine.alloc_buffer((d_model * n) as u64 * 4);
             upload(&buf, &transposed);
             emb_bufs.push((buf, n));
             chunk_start = chunk_end;
         }
         // GPU attention buffers
-        let attn_q_buf = engine.alloc_buffer((D_MODEL as u64) * 4);
-        let attn_out_buf = engine.alloc_buffer((D_MODEL as u64) * 4);
-        let kv_size = (MAX_SEQ * N_KV_HEADS * HEAD_DIM) as u64 * 2;  // f16: 2 bytes per element
-        let mut kv_bufs = Vec::with_capacity(N_LAYERS);
-        for _ in 0..N_LAYERS {
+        let attn_q_buf = engine.alloc_buffer((d_model as u64) * 4);
+        let attn_out_buf = engine.alloc_buffer((d_model as u64) * 4);
+        let kv_stride = config.n_kv_heads * config.head_dim;
+        let kv_size = (MAX_SEQ * kv_stride) as u64 * 2;  // f16
+        let mut kv_bufs = Vec::with_capacity(config.n_layers);
+        for _ in 0..config.n_layers {
             let kb = engine.alloc_buffer(kv_size);
             let vb = engine.alloc_buffer(kv_size);
             kv_bufs.push((kb, vb));
         }
-        total_gpu += N_LAYERS as u64 * kv_size * 2 + D_MODEL as u64 * 4 * 2;
+        total_gpu += config.n_layers as u64 * kv_size * 2 + d_model as u64 * 4 * 2;
 
         // Per-chunk logit output buffers for batched logits
         let mut logit_out_bufs = Vec::with_capacity(emb_bufs.len());
@@ -724,8 +864,8 @@ impl Phi4Model {
         }
 
         // Pre-allocate persistent descriptor sets for each layer
-        let d4 = D_MODEL as u64 * 4;
-        for i in 0..N_LAYERS {
+        let d4 = d_model as u64 * 4;
+        for i in 0..config.n_layers {
             let layer = &layers[i];
             let bpr_qkv = layer.attn_qkv_k as u64 / 256;
             let wb_qkv = layer.attn_qkv_n as u64 * bpr_qkv * layer.attn_qkv_type.block_bytes() as u64;
@@ -767,21 +907,24 @@ impl Phi4Model {
         }
 
         // GPU-resident pipeline buffers
-        let gpu_hidden = engine.alloc_buffer(D_MODEL as u64 * 4);
-        let gpu_normed = engine.alloc_buffer(D_MODEL as u64 * 4);
-        let gpu_qkv = engine.alloc_buffer(QKV_DIM as u64 * 4);
-        let gpu_gate_up = engine.alloc_buffer(GATE_UP_DIM as u64 * 4);
-        let gpu_ffn_mid = engine.alloc_buffer(FFN_DIM as u64 * 4);
-        let gpu_tmp = engine.alloc_buffer(D_MODEL as u64 * 4);
-        let gpu_rope_factors = engine.alloc_buffer((ROPE_DIM as u64 / 2) * 4);
-        upload(&gpu_rope_factors, &rope_factors);
+        let qkv_dim = config.qkv_dim();
+        let gpu_hidden = engine.alloc_buffer(d_model as u64 * 4);
+        let gpu_normed = engine.alloc_buffer(d_model as u64 * 4);
+        let gpu_qkv = engine.alloc_buffer(qkv_dim as u64 * 4);
+        let gpu_gate_up = engine.alloc_buffer(gate_up_dim as u64 * 4);
+        let gpu_ffn_mid = engine.alloc_buffer(config.ffn_dim as u64 * 4);
+        let gpu_tmp = engine.alloc_buffer(d_model as u64 * 4);
+        let rope_factor_len = if rope_factors.is_empty() { 1 } else { rope_factors.len() };
+        let gpu_rope_factors = engine.alloc_buffer(rope_factor_len as u64 * 4);
+        if !rope_factors.is_empty() { upload(&gpu_rope_factors, &rope_factors); }
 
-        // Pre-allocate ALL 384 descriptor sets for the mega-batch
-        let d4 = D_MODEL as u64 * 4;
-        let kv_max_bytes = (MAX_SEQ * N_KV_HEADS * HEAD_DIM) as u64 * 2;  // f16
-        let mut mega_dispatches: Vec<PrebuiltDispatch> = Vec::with_capacity(12 * N_LAYERS);
+        // Pre-allocate descriptor sets for the mega-batch (combined QKV models only)
+        let d4 = d_model as u64 * 4;
+        let kv_max_bytes = (MAX_SEQ * kv_stride) as u64 * 2;
+        let mut mega_dispatches: Vec<PrebuiltDispatch> = Vec::new();
 
-        for i in 0..N_LAYERS {
+        if !config.separate_qkv && !config.separate_gate_up {
+        for i in 0..config.n_layers {
             let layer = &layers[i];
             let (ref kb, ref vb) = kv_bufs[i];
             let bpr_qkv = layer.attn_qkv_k as u64 / 256;
@@ -792,11 +935,11 @@ impl Phi4Model {
             let wb_up = layer.ffn_up_n as u64 * bpr_up * layer.ffn_up_type.block_bytes() as u64;
             let bpr_dn = layer.ffn_down_k as u64 / 256;
             let wb_dn = layer.ffn_down_n as u64 * bpr_dn * layer.ffn_down_type.block_bytes() as u64;
-            let rope_pairs = (N_HEADS + N_KV_HEADS) * (ROPE_DIM / 2);
+            let rope_pairs = (config.n_heads + config.n_kv_heads) * (config.rope_dim / 2);
             let rope_wg = ((rope_pairs + 63) / 64) as u32;
-            let kv_store_wg = (((N_KV_HEADS * HEAD_DIM / 2) as u32 + 255) / 256) as u32;  // /2: each thread packs 2 f16
-            let silu_wg = ((FFN_DIM as u32 + 255) / 256) as u32;
-            let resid_wg = ((D_MODEL as u32 + 255) / 256) as u32;
+            let kv_store_wg = ((kv_stride / 2 + 255) / 256) as u32;
+            let silu_wg = ((config.ffn_dim + 255) / 256) as u32;
+            let resid_wg = ((d_model + 255) / 256) as u32;
 
             macro_rules! pre {
                 ($name:expr, $bufs:expr, $sizes:expr, $wg:expr) => {
@@ -816,17 +959,16 @@ impl Phi4Model {
             pre!(layer.attn_qkv_type.shader_name(), &[&gpu_normed, &layer.attn_qkv_buf, &gpu_qkv],
                 &[layer.attn_qkv_k as u64*4, wb_qkv, layer.attn_qkv_n as u64*4],
                 [layer.attn_qkv_type.workgroups(layer.attn_qkv_n), 1, 1]);
-            // Fused RoPE + KV store (eliminates one dispatch + one barrier)
+            // Fused RoPE + KV store
             let fused_wg = {
-                let rope_pairs = (N_HEADS + N_KV_HEADS) * (ROPE_DIM / 2);
-                let half_kv = N_KV_HEADS * HEAD_DIM / 2;
-                let max_threads = std::cmp::max(rope_pairs, half_kv);
-                ((max_threads + 63) / 64) as u32
+                let rp = (config.n_heads + config.n_kv_heads) * (config.rope_dim / 2);
+                let hkv = kv_stride / 2;
+                ((std::cmp::max(rp, hkv) + 63) / 64) as u32
             };
             pre!("rope_kv_store", &[&gpu_qkv, &gpu_rope_factors, kb, vb],
-                &[QKV_DIM as u64*4, (ROPE_DIM as u64/2)*4, kv_max_bytes, kv_max_bytes], [fused_wg, 1, 1]);
+                &[qkv_dim as u64*4, rope_factor_len as u64*4, kv_max_bytes, kv_max_bytes], [fused_wg, 1, 1]);
             pre!("attention", &[&gpu_qkv, kb, vb, &attn_out_buf],
-                &[d4, kv_max_bytes, kv_max_bytes, d4], [N_HEADS as u32, 1, 1]);
+                &[d4, kv_max_bytes, kv_max_bytes, d4], [config.n_heads as u32, 1, 1]);
             pre!(layer.attn_output_type.shader_name(), &[&attn_out_buf, &layer.attn_output_buf, &gpu_tmp],
                 &[layer.attn_output_k as u64*4, wb_out, layer.attn_output_n as u64*4],
                 [layer.attn_output_type.workgroups(layer.attn_output_n), 1, 1]);
@@ -836,17 +978,17 @@ impl Phi4Model {
                 &[layer.ffn_up_k as u64*4, wb_up, layer.ffn_up_n as u64*4],
                 [layer.ffn_up_type.workgroups(layer.ffn_up_n), 1, 1]);
             pre!("silu_gate", &[&gpu_gate_up, &gpu_ffn_mid],
-                &[GATE_UP_DIM as u64*4, FFN_DIM as u64*4], [silu_wg, 1, 1]);
+                &[gate_up_dim as u64*4, config.ffn_dim as u64*4], [silu_wg, 1, 1]);
             pre!(layer.ffn_down_type.shader_name(), &[&gpu_ffn_mid, &layer.ffn_down_buf, &gpu_tmp],
                 &[layer.ffn_down_k as u64*4, wb_dn, layer.ffn_down_n as u64*4],
                 [layer.ffn_down_type.workgroups(layer.ffn_down_n), 1, 1]);
             pre!("residual_add", &[&gpu_hidden, &gpu_tmp, &gpu_hidden], &[d4, d4, d4], [resid_wg, 1, 1]);
         }
 
-        // (intermediate log removed — final count printed below)
+        } // end if !separate_qkv
 
-        // Append output norm + logit chunk dispatches to mega_dispatches
-        let gpu_output_norm_w = engine.alloc_buffer(D_MODEL as u64 * 4);
+        // Append output norm + logit chunk dispatches to mega_dispatches (if mega-batch enabled)
+        let gpu_output_norm_w = engine.alloc_buffer(d_model as u64 * 4);
         upload(&gpu_output_norm_w, &output_norm);
         // Output RMS norm: gpu_hidden → gpu_normed
         {
@@ -856,9 +998,10 @@ impl Phi4Model {
                 pipeline_name: "rmsnorm".to_string(), desc_set: ds, workgroups: [1,1,1], needs_barrier: true,
             });
         }
-        // Logit matmul chunks: gpu_normed × emb_chunk → logit_out_bufs (NO barriers between them)
+        // Logit matmul chunks: gpu_normed × emb_chunk → logit_out_bufs
+        if !mega_dispatches.is_empty() {
         let mk = 1u32;
-        let kk = D_MODEL as u32;
+        let kk = d_model as u32;
         for (i, (emb_buf, chunk_n)) in emb_bufs.iter().enumerate() {
             let n = *chunk_n as u32;
             let ds = engine.pre_allocate_desc_set("matmul_tiled",
@@ -869,6 +1012,8 @@ impl Phi4Model {
                 workgroups: [(n + 15) / 16, (mk + 15) / 16, 1], needs_barrier: false,
             });
         }
+
+        } // end if mega_dispatches logit chunks
 
         // Scratch buffers for argmax (not used yet — keep CPU argmax for now)
         let gpu_logits = engine.alloc_buffer(4);  // placeholder
@@ -902,9 +1047,12 @@ impl Phi4Model {
         )
     }
 
-    /// Zero-CPU forward pass with pre-allocated descriptor sets.
-    /// 384 dispatches across 32 layers in ONE submit. Zero Vulkan allocations.
+    /// Forward pass — mega-batch if available, else per-dispatch fallback.
     pub unsafe fn forward_gpu(&self, engine: &ComputeEngine, hidden: &mut Vec<f32>, cache: &mut KVCache) -> Vec<f32> {
+        // Mega-batch only works for combined QKV models (Phi-4). Others use dynamic path.
+        if self.config.separate_qkv || self.config.separate_gate_up {
+            return self.forward_dynamic(engine, hidden, cache);
+        }
         assert_eq!(hidden.len(), D_MODEL);
         let pos = cache.len;
         let d = D_MODEL as u32;
@@ -1393,6 +1541,202 @@ impl Phi4Model {
         (accepted, verified_logits)
     }
 
+    /// Config-aware forward pass for any architecture (separate Q/K/V, biases, etc.)
+    pub unsafe fn forward_dynamic(&self, engine: &ComputeEngine, hidden: &mut Vec<f32>, cache: &mut KVCache) -> Vec<f32> {
+        let cfg = &self.config;
+        let pos = cache.len;
+        let d = cfg.d_model as u32;
+        let heads_per_kv = cfg.n_heads / cfg.n_kv_heads;
+        let kv_stride = cfg.n_kv_heads * cfg.head_dim;
+        let norm_push: Vec<u8> = [1u32, d].iter().flat_map(|v| v.to_le_bytes()).collect();
+
+        for (li, layer) in self.layers.iter().enumerate() {
+            // --- RMS norm → Q matmul (or combined QKV matmul) ---
+            upload(&self.buf_a, hidden);
+            let qkv_d = Self::kquant_dispatch(
+                &self.buf_c, &layer.attn_qkv_buf, &self.buf_a,
+                layer.attn_qkv_type, layer.attn_qkv_k, layer.attn_qkv_n);
+            {
+                let bufs1: Vec<&GpuBuffer> = vec![&self.buf_a, &layer.attn_norm_buf, &self.buf_c];
+                let sizes1: Vec<u64> = vec![d as u64 * 4; 3];
+                engine.dispatch_batch(&[
+                    ("rmsnorm", &bufs1, &sizes1, &norm_push, [1, 1, 1]),
+                    (qkv_d.0.as_str(), &qkv_d.1, &qkv_d.2, &qkv_d.3, qkv_d.4),
+                ]);
+            }
+            let q_dim = cfg.n_heads * cfg.head_dim;
+            let k_dim = cfg.n_kv_heads * cfg.head_dim;
+
+            let (mut q, mut k, v);
+            if cfg.separate_qkv {
+                // Separate Q/K/V: buf_a has Q result. Dispatch K and V separately.
+                let mut q_raw = vec![0.0f32; q_dim];
+                download(&self.buf_a, &mut q_raw);
+
+                // K matmul: normed (in buf_c) → K
+                let (ref k_buf, ref k_type, k_k, k_n) = layer.attn_k_buf.as_ref().unwrap();
+                let k_d = Self::kquant_dispatch(&self.buf_c, k_buf, &self.buf_a, *k_type, *k_k, *k_n);
+                engine.dispatch_by_name(k_d.0.as_str(), &k_d.1, &k_d.2, &k_d.3, k_d.4);
+                let mut k_raw = vec![0.0f32; k_dim];
+                download(&self.buf_a, &mut k_raw);
+
+                // V matmul
+                let (ref v_buf, ref v_type, v_k, v_n) = layer.attn_v_buf.as_ref().unwrap();
+                let v_d = Self::kquant_dispatch(&self.buf_c, v_buf, &self.buf_a, *v_type, *v_k, *v_n);
+                engine.dispatch_by_name(v_d.0.as_str(), &v_d.1, &v_d.2, &v_d.3, v_d.4);
+                let mut v_raw = vec![0.0f32; k_dim];
+                download(&self.buf_a, &mut v_raw);
+
+                // Apply bias if present
+                if let Some(ref bias) = layer.qkv_bias {
+                    for i in 0..q_dim { q_raw[i] += bias[i]; }
+                    for i in 0..k_dim { k_raw[i] += bias[q_dim + i]; }
+                    for i in 0..k_dim { v_raw[i] += bias[q_dim + k_dim + i]; }
+                }
+                q = q_raw; k = k_raw; v = v_raw;
+            } else {
+                // Combined QKV
+                let qkv_dim = cfg.qkv_dim();
+                let mut qkv = vec![0.0f32; qkv_dim];
+                download(&self.buf_a, &mut qkv[..qkv_dim]);
+                let k_end = q_dim + k_dim;
+                q = qkv[..q_dim].to_vec();
+                k = qkv[q_dim..k_end].to_vec();
+                v = qkv[k_end..].to_vec();
+            }
+
+            apply_rope_cfg(&mut q, pos, cfg.n_heads, cfg, &self.rope_factors);
+            apply_rope_cfg(&mut k, pos, cfg.n_kv_heads, cfg, &self.rope_factors);
+
+            // KV cache update (f16 via GPU shader)
+            let mut qkv_concat = Vec::with_capacity(q.len() + k.len() + v.len());
+            qkv_concat.extend_from_slice(&q);
+            qkv_concat.extend_from_slice(&k);
+            qkv_concat.extend_from_slice(&v);
+            upload(&self.gpu_qkv, &qkv_concat);
+            let (ref kbuf, ref vbuf) = self.kv_bufs[li];
+            let rope_kv_push: Vec<u8> = [pos as u32, cfg.n_heads as u32, cfg.n_kv_heads as u32,
+                cfg.head_dim as u32, 0u32, // rope_dim=0 means skip rope (already applied)
+                q_dim as u32, kv_stride as u32]
+                .iter().flat_map(|v| v.to_le_bytes()).collect();
+            // Use kv_store directly instead of rope_kv_store (RoPE already done)
+            let half_kv = kv_stride / 2;
+            let kv_store_push: Vec<u8> = [pos as u32, q_dim as u32, kv_stride as u32]
+                .iter().flat_map(|v| v.to_le_bytes()).collect();
+            let kv_store_wg = ((half_kv + 255) / 256) as u32;
+            engine.dispatch_by_name("kv_store",
+                &[&self.gpu_qkv, kbuf, vbuf],
+                &[(q_dim + 2*kv_stride) as u64 * 4, (MAX_SEQ * kv_stride) as u64 * 2, (MAX_SEQ * kv_stride) as u64 * 2],
+                &kv_store_push, [kv_store_wg, 1, 1]);
+
+            // Attention
+            let seq_len = pos + 1;
+            upload(&self.attn_q_buf, &q);
+            let attn_push: Vec<u8> = [seq_len as u32, cfg.n_kv_heads as u32, heads_per_kv as u32]
+                .iter().flat_map(|v| v.to_le_bytes()).collect();
+            let kv_bytes = (seq_len * kv_stride) as u64 * 2;
+            engine.dispatch_by_name("attention",
+                &[&self.attn_q_buf, kbuf, vbuf, &self.attn_out_buf],
+                &[cfg.d_model as u64 * 4, kv_bytes, kv_bytes, cfg.d_model as u64 * 4],
+                &attn_push, [cfg.n_heads as u32, 1, 1]);
+
+            // Output projection + residual
+            let out_push: Vec<u8> = [layer.attn_output_k, layer.attn_output_n]
+                .iter().flat_map(|v| v.to_le_bytes()).collect();
+            gpu_matmul_kquant(engine, &self.buf_a, &layer.attn_output_buf, &self.buf_c,
+                layer.attn_output_type, &{let mut ao = vec![0.0f32; cfg.d_model]; download(&self.attn_out_buf, &mut ao); ao},
+                &mut vec![0.0f32; cfg.d_model], layer.attn_output_k, layer.attn_output_n);
+            let mut tmp = vec![0.0f32; cfg.d_model];
+            download(&self.buf_c, &mut tmp);
+            for i in 0..cfg.d_model { hidden[i] += tmp[i]; }
+
+            // FFN: norm → gate + up → SiLU → down → residual
+            upload(&self.buf_a, hidden);
+            if cfg.separate_gate_up {
+                // Separate gate and up matmuls
+                let bufs1: Vec<&GpuBuffer> = vec![&self.buf_a, &layer.ffn_norm_buf, &self.buf_c];
+                let sizes1: Vec<u64> = vec![d as u64 * 4; 3];
+                engine.dispatch_batch(&[("rmsnorm", &bufs1, &sizes1, &norm_push, [1, 1, 1])]);
+                // normed is in buf_c. Dispatch gate matmul (stored in ffn_up_buf)
+                let gate_d = Self::kquant_dispatch(&self.buf_c, &layer.ffn_up_buf, &self.buf_a,
+                    layer.ffn_up_type, layer.ffn_up_k, layer.ffn_up_n);
+                engine.dispatch_by_name(gate_d.0.as_str(), &gate_d.1, &gate_d.2, &gate_d.3, gate_d.4);
+                let mut gate = vec![0.0f32; cfg.ffn_dim];
+                download(&self.buf_a, &mut gate);
+                // up matmul
+                let (ref up_buf, ref up_type, up_k, up_n) = layer.ffn_gate_buf.as_ref().unwrap();
+                let up_d = Self::kquant_dispatch(&self.buf_c, up_buf, &self.buf_a, *up_type, *up_k, *up_n);
+                engine.dispatch_by_name(up_d.0.as_str(), &up_d.1, &up_d.2, &up_d.3, up_d.4);
+                let mut up = vec![0.0f32; cfg.ffn_dim];
+                download(&self.buf_a, &mut up);
+                // SiLU(gate) * up
+                let mut ffn_mid = vec![0.0f32; cfg.ffn_dim];
+                for i in 0..cfg.ffn_dim {
+                    let silu = gate[i] / (1.0 + (-gate[i]).exp());
+                    ffn_mid[i] = silu * up[i];
+                }
+                gpu_matmul_kquant(engine, &self.buf_a, &layer.ffn_down_buf, &self.buf_c,
+                    layer.ffn_down_type, &ffn_mid, &mut tmp, layer.ffn_down_k, layer.ffn_down_n);
+            } else {
+                // Combined gate+up (Phi-4 style)
+                let up_d = Self::kquant_dispatch(&self.buf_c, &layer.ffn_up_buf, &self.buf_a,
+                    layer.ffn_up_type, layer.ffn_up_k, layer.ffn_up_n);
+                {
+                    let bufs1: Vec<&GpuBuffer> = vec![&self.buf_a, &layer.ffn_norm_buf, &self.buf_c];
+                    let sizes1: Vec<u64> = vec![d as u64 * 4; 3];
+                    engine.dispatch_batch(&[
+                        ("rmsnorm", &bufs1, &sizes1, &norm_push, [1, 1, 1]),
+                        (up_d.0.as_str(), &up_d.1, &up_d.2, &up_d.3, up_d.4),
+                    ]);
+                }
+                let mut gate_up = vec![0.0f32; cfg.gate_up_dim()];
+                download(&self.buf_a, &mut gate_up);
+                let (gate, up) = gate_up.split_at_mut(cfg.ffn_dim);
+                cpu_silu(gate);
+                let mut ffn_mid = vec![0.0f32; cfg.ffn_dim];
+                for i in 0..cfg.ffn_dim { ffn_mid[i] = gate[i] * up[i]; }
+                gpu_matmul_kquant(engine, &self.buf_a, &layer.ffn_down_buf, &self.buf_c,
+                    layer.ffn_down_type, &ffn_mid, &mut tmp, layer.ffn_down_k, layer.ffn_down_n);
+            }
+            for i in 0..cfg.d_model { hidden[i] += tmp[i]; }
+        }
+
+        cache.len += 1;
+
+        // Output norm + logits
+        let mut norm = vec![0.0f32; cfg.d_model];
+        rms_norm(hidden, &self.output_norm, &mut norm);
+        upload(&self.buf_a, &norm);
+        let mk = 1u32; let kk = cfg.d_model as u32;
+        let mut dispatches_data: Vec<(Vec<u8>, [u32; 3], usize)> = Vec::new();
+        for (i, (_, chunk_n)) in self.emb_bufs.iter().enumerate() {
+            let n = *chunk_n as u32;
+            let pb: Vec<u8> = [mk, kk, n].iter().flat_map(|v| v.to_le_bytes()).collect();
+            dispatches_data.push((pb, [(n+15)/16, (mk+15)/16, 1], i));
+        }
+        let dsp: Vec<(&str, Vec<&GpuBuffer>, Vec<u64>, &[u8], [u32; 3])> = dispatches_data.iter()
+            .map(|(pb, groups, i)| {
+                let n = self.emb_bufs[*i].1;
+                ("matmul_tiled",
+                 vec![&self.buf_a, &self.emb_bufs[*i].0, &self.logit_out_bufs[*i]],
+                 vec![(mk as u64)*(kk as u64)*4, (kk as u64)*(n as u64)*4, (mk as u64)*(n as u64)*4],
+                 pb.as_slice(), *groups)
+            }).collect();
+        let refs: Vec<(&str, &[&GpuBuffer], &[u64], &[u8], [u32; 3])> = dsp.iter()
+            .map(|(n, b, s, p, g)| (*n, b.as_slice(), s.as_slice(), *p, *g)).collect();
+        engine.dispatch_batch_parallel(&refs);
+
+        let mut logits = vec![0.0f32; cfg.vocab_size];
+        let mut vo = 0usize;
+        for (i, (_, cn)) in self.emb_bufs.iter().enumerate() {
+            let n = *cn;
+            let src = std::slice::from_raw_parts(self.logit_out_bufs[i].mapped as *const f32, n);
+            logits[vo..vo+n].copy_from_slice(src);
+            vo += n;
+        }
+        logits
+    }
+
     pub unsafe fn forward(&self, engine: &ComputeEngine, hidden: &mut Vec<f32>, cache: &mut KVCache) -> Vec<f32> {
         assert_eq!(hidden.len(), D_MODEL);
         let pos = cache.len;
@@ -1691,8 +2035,9 @@ impl Phi4Model {
     }
 
     pub fn embed(&self, token_id: u32) -> Vec<f32> {
-        let s = token_id as usize * D_MODEL;
-        self.embedding[s..s + D_MODEL].to_vec()
+        let d = self.config.d_model;
+        let s = token_id as usize * d;
+        self.embedding[s..s + d].to_vec()
     }
 
     pub unsafe fn generate(
