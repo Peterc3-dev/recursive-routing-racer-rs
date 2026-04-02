@@ -1139,6 +1139,151 @@ impl Phi4Model {
         logits
     }
 
+    /// Draft forward: run only the first `n_layers` layers, then output norm + logits.
+    /// Uses the same mega_dispatches table but only dispatches entries 0..n_layers*11.
+    /// Returns logits (for draft token prediction).
+    pub unsafe fn forward_draft(
+        &self, engine: &ComputeEngine, hidden: &mut Vec<f32>, cache: &mut KVCache, n_layers: usize,
+    ) -> Vec<f32> {
+        assert_eq!(hidden.len(), D_MODEL);
+        let pos = cache.len;
+        let d = D_MODEL as u32;
+        let heads_per_kv = N_HEADS / N_KV_HEADS;
+        let kv_stride = (N_KV_HEADS * HEAD_DIM) as u32;
+        let seq_len = pos as u32 + 1;
+        let dispatches_per_layer = 11usize;
+
+        upload(&self.gpu_hidden, hidden);
+
+        // Build push constants for draft layers only
+        let norm_push: Vec<u8> = [1u32, d].iter().flat_map(|v| v.to_le_bytes()).collect();
+        let rope_kv_push: Vec<u8> = [pos as u32, N_HEADS as u32, N_KV_HEADS as u32, HEAD_DIM as u32, ROPE_DIM as u32,
+            (N_HEADS * HEAD_DIM) as u32, (N_KV_HEADS * HEAD_DIM) as u32]
+            .iter().flat_map(|v| v.to_le_bytes()).collect();
+        let attn_push: Vec<u8> = [seq_len, N_KV_HEADS as u32, heads_per_kv as u32]
+            .iter().flat_map(|v| v.to_le_bytes()).collect();
+        let silu_push: Vec<u8> = [FFN_DIM as u32].iter().flat_map(|v| v.to_le_bytes()).collect();
+        let resid_push: Vec<u8> = [d].iter().flat_map(|v| v.to_le_bytes()).collect();
+
+        let push_map: [&[u8]; 11] = [
+            &norm_push, &[], &rope_kv_push, &attn_push,
+            &[], &resid_push, &norm_push, &[], &silu_push, &[], &resid_push,
+        ];
+
+        let n_draft_dispatches = dispatches_per_layer * n_layers;
+        let mut push_data: Vec<Vec<u8>> = Vec::with_capacity(n_draft_dispatches);
+        for i in 0..n_draft_dispatches {
+            let slot = i % dispatches_per_layer;
+            let li = i / dispatches_per_layer;
+            let layer = &self.layers[li];
+            let push = match slot {
+                1 => [layer.attn_qkv_k, layer.attn_qkv_n].iter().flat_map(|v| v.to_le_bytes()).collect(),
+                4 => [layer.attn_output_k, layer.attn_output_n].iter().flat_map(|v| v.to_le_bytes()).collect(),
+                7 => [layer.ffn_up_k, layer.ffn_up_n].iter().flat_map(|v| v.to_le_bytes()).collect(),
+                9 => [layer.ffn_down_k, layer.ffn_down_n].iter().flat_map(|v| v.to_le_bytes()).collect(),
+                _ => push_map[slot].to_vec(),
+            };
+            push_data.push(push);
+        }
+
+        // Dispatch only the first n_layers worth of the pre-built table
+        let dispatches: Vec<(&str, DescSetHandle, &[u8], [u32; 3], bool)> = self.mega_dispatches[..n_draft_dispatches]
+            .iter().enumerate()
+            .map(|(i, d)| (d.pipeline_name.as_str(), d.desc_set, push_data[i].as_slice(), d.workgroups, d.needs_barrier))
+            .collect();
+        engine.dispatch_batch_persistent_v2(&dispatches);
+
+        cache.len += 1;
+
+        // Download hidden, output norm, logits (same as forward_gpu tail)
+        download(&self.gpu_hidden, hidden);
+        let mut norm = vec![0.0f32; D_MODEL];
+        rms_norm(hidden, &self.output_norm, &mut norm);
+
+        // Quick CPU logits (argmax only, skip full vocab projection for speed)
+        // Actually we need full logits for speculative verify. Use GPU path.
+        upload(&self.buf_a, &norm);
+        let mk = 1u32; let kk = D_MODEL as u32;
+        let mut dispatches_data: Vec<(Vec<u8>, [u32; 3], usize)> = Vec::new();
+        for (i, (_, chunk_n)) in self.emb_bufs.iter().enumerate() {
+            let n = *chunk_n as u32;
+            let pb: Vec<u8> = [mk, kk, n].iter().flat_map(|v| v.to_le_bytes()).collect();
+            dispatches_data.push((pb, [(n+15)/16, (mk+15)/16, 1], i));
+        }
+        let dsp: Vec<(&str, Vec<&GpuBuffer>, Vec<u64>, &[u8], [u32; 3])> = dispatches_data.iter()
+            .map(|(pb, groups, i)| {
+                let n = self.emb_bufs[*i].1;
+                ("matmul_tiled",
+                 vec![&self.buf_a, &self.emb_bufs[*i].0, &self.logit_out_bufs[*i]],
+                 vec![(mk as u64)*(kk as u64)*4, (kk as u64)*(n as u64)*4, (mk as u64)*(n as u64)*4],
+                 pb.as_slice(), *groups)
+            }).collect();
+        let refs: Vec<(&str, &[&GpuBuffer], &[u64], &[u8], [u32; 3])> = dsp.iter()
+            .map(|(n, b, s, p, g)| (*n, b.as_slice(), s.as_slice(), *p, *g)).collect();
+        engine.dispatch_batch_parallel(&refs);
+
+        let mut logits = vec![0.0f32; VOCAB_SIZE];
+        let mut vo = 0usize;
+        for (i, (_, cn)) in self.emb_bufs.iter().enumerate() {
+            let n = *cn;
+            let src = std::slice::from_raw_parts(self.logit_out_bufs[i].mapped as *const f32, n);
+            logits[vo..vo+n].copy_from_slice(src);
+            vo += n;
+        }
+        logits
+    }
+
+    /// Speculative decode: draft K tokens with first `draft_layers` layers,
+    /// then verify with full model. Returns accepted tokens.
+    pub unsafe fn speculative_decode(
+        &self, engine: &ComputeEngine, last_logits: &[f32], cache: &mut KVCache,
+        draft_layers: usize, draft_k: usize,
+    ) -> (Vec<u32>, Vec<f32>) {
+        // Step 1: Draft K tokens using shallow model
+        let mut draft_tokens = Vec::with_capacity(draft_k);
+        let mut draft_logits = last_logits.to_vec();
+        let save_pos = cache.len;
+
+        for _ in 0..draft_k {
+            let (best, _) = draft_logits.iter().enumerate()
+                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap();
+            let tok = best as u32;
+            draft_tokens.push(tok);
+
+            let mut hidden = self.embed(tok);
+            draft_logits = self.forward_draft(engine, &mut hidden, cache, draft_layers);
+        }
+
+        // Step 2: Rewind cache to before draft
+        cache.len = save_pos;
+
+        // Step 3: Verify all draft tokens with full model
+        // Run forward_gpu for each draft token (using full 32 layers)
+        let mut verified_logits = Vec::new();
+        let mut accepted = Vec::new();
+
+        for (i, &tok) in draft_tokens.iter().enumerate() {
+            let mut hidden = self.embed(tok);
+            let verify_logits = self.forward_gpu(engine, &mut hidden, cache);
+
+            let (verify_top, _) = verify_logits.iter().enumerate()
+                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap();
+
+            if verify_top as u32 == draft_tokens.get(i + 1).copied().unwrap_or(verify_top as u32) || i == draft_k - 1 {
+                // Draft's NEXT token matches verify's prediction at this position, accept
+                accepted.push(tok);
+                verified_logits = verify_logits;
+            } else {
+                // Mismatch — accept this token but use verify's prediction going forward
+                accepted.push(tok);
+                verified_logits = verify_logits;
+                break;
+            }
+        }
+
+        (accepted, verified_logits)
+    }
+
     pub unsafe fn forward(&self, engine: &ComputeEngine, hidden: &mut Vec<f32>, cache: &mut KVCache) -> Vec<f32> {
         assert_eq!(hidden.len(), D_MODEL);
         let pos = cache.len;

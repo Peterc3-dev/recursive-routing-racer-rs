@@ -11,6 +11,9 @@ const EOS_TOKEN: u32 = 199999;  // <|endoftext|> for Phi-4
 
 fn main() {
     let batch = std::env::args().any(|a| a == "--batch");
+    let speculative = std::env::args().any(|a| a == "--speculative");
+    let draft_layers: usize = 8;
+    let draft_k: usize = 4;
 
     let gguf = model::GGUFModel::load(GGUF_PATH);
     let tokenizer = model::BPETokenizer::from_gguf(&gguf);
@@ -36,23 +39,61 @@ fn main() {
             let gt = Instant::now();
             let mut gen_count = 0usize;
             let mut output = String::new();
+            let mut accepted_total = 0usize;
+            let mut verify_calls = 0usize;
 
-            for _ in 0..MAX_TOKENS {
-                let (best_id, _) = logits.iter().enumerate()
-                    .max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap();
-                let tok = best_id as u32;
-                if tok == EOS_TOKEN { break; }
+            if speculative {
+                while gen_count < MAX_TOKENS {
+                    let (accepted, new_logits) = phi4.speculative_decode(
+                        &engine, &logits, &mut cache, draft_layers, draft_k);
+                    verify_calls += 1;
 
-                output.push_str(&tokenizer.decode(&[tok]));
-                gen_count += 1;
+                    let mut eos = false;
+                    for &tok in &accepted {
+                        if tok == EOS_TOKEN { eos = true; break; }
+                        output.push_str(&tokenizer.decode(&[tok]));
+                        gen_count += 1;
+                    }
+                    accepted_total += accepted.len();
 
-                let mut hidden = phi4.embed(tok);
-                logits = phi4.forward_gpu(&engine, &mut hidden, &mut cache);
+                    // Get the next token from verify logits
+                    let (best, _) = new_logits.iter().enumerate()
+                        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap();
+                    let correction = best as u32;
+                    if correction == EOS_TOKEN || eos { break; }
+
+                    output.push_str(&tokenizer.decode(&[correction]));
+                    gen_count += 1;
+
+                    // Run the correction token through full model to get next logits
+                    let mut hidden = phi4.embed(correction);
+                    logits = phi4.forward_gpu(&engine, &mut hidden, &mut cache);
+                }
+            } else {
+                for _ in 0..MAX_TOKENS {
+                    let (best_id, _) = logits.iter().enumerate()
+                        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap();
+                    let tok = best_id as u32;
+                    if tok == EOS_TOKEN { break; }
+
+                    output.push_str(&tokenizer.decode(&[tok]));
+                    gen_count += 1;
+
+                    let mut hidden = phi4.embed(tok);
+                    logits = phi4.forward_gpu(&engine, &mut hidden, &mut cache);
+                }
             }
 
             let gen_time = gt.elapsed().as_secs_f32();
-            eprintln!("[{} tokens, {:.1} tok/s]", gen_count,
-                if gen_time > 0.0 { gen_count as f32 / gen_time } else { 0.0 });
+            if speculative {
+                let accept_rate = if verify_calls > 0 { accepted_total as f32 / (verify_calls as f32 * draft_k as f32) } else { 0.0 };
+                eprintln!("[{} tokens, {:.1} tok/s, speculative: {:.0}% accept rate, {} verify calls]",
+                    gen_count, if gen_time > 0.0 { gen_count as f32 / gen_time } else { 0.0 },
+                    accept_rate * 100.0, verify_calls);
+            } else {
+                eprintln!("[{} tokens, {:.1} tok/s]", gen_count,
+                    if gen_time > 0.0 { gen_count as f32 / gen_time } else { 0.0 });
+            }
 
             print!("{}", output);
             std::io::stdout().flush().unwrap();
