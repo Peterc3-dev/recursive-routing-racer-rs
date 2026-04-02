@@ -117,13 +117,14 @@ const ROPE_ATTN_FACTOR: f32 = 1.190238;
 
 /// Quant type determines which shader + block size to use
 #[derive(Clone, Copy)]
-enum QType { Q4K, Q5K, Q6K, GPUQ4, GPUQ5, GPUQ6 }
+enum QType { Q4K, Q5K, Q6K, GPUQ4, GPUQ5, GPUQ6, F32 }
 
 impl QType {
     fn shader_name(&self) -> &str {
         match self {
             QType::Q4K => "matmul_q4k", QType::Q5K => "matmul_q5k", QType::Q6K => "matmul_q6k",
             QType::GPUQ4 => "matmul_gpuq4", QType::GPUQ5 => "matmul_gpuq5", QType::GPUQ6 => "matmul_gpuq6",
+            QType::F32 => "matmul_tiled",
         }
     }
     fn batch_shader_name(&self) -> &str {
@@ -131,6 +132,7 @@ impl QType {
             QType::Q4K | QType::GPUQ4 => "matmul_gpuq4_batch",
             QType::Q5K | QType::GPUQ5 => "matmul_gpuq5_batch",
             QType::Q6K | QType::GPUQ6 => "matmul_gpuq6_batch",
+            QType::F32 => "matmul_tiled",  // TODO: F32 batch shader
         }
     }
     fn fused_shader_name(&self) -> &str {
@@ -138,17 +140,19 @@ impl QType {
             QType::Q4K | QType::GPUQ4 => "fused_norm_matmul_q4k",
             QType::Q5K | QType::GPUQ5 => "fused_norm_matmul_q5k",
             QType::Q6K | QType::GPUQ6 => "fused_norm_matmul_q6k",
+            QType::F32 => "matmul_tiled",
         }
     }
     fn block_bytes(&self) -> usize {
         match self {
             QType::Q4K => 144, QType::Q5K => 176, QType::Q6K => 210,
             QType::GPUQ4 => 192, QType::GPUQ5 | QType::GPUQ6 => 320,
+            QType::F32 => 1024, // 256 elements * 4 bytes (not block-based)
         }
     }
     fn workgroups(&self, n: u32) -> u32 { n }
     fn from_gguf(typ: u32) -> Self {
-        match typ { 12 => QType::Q4K, 13 => QType::Q5K, 14 => QType::Q6K, _ => panic!("Unsupported quant type {}", typ) }
+        match typ { 12 => QType::Q4K, 13 => QType::Q5K, 14 => QType::Q6K, _ => QType::F32 }
     }
 }
 
@@ -537,6 +541,34 @@ fn dequant_q5_k(data: &[u8], n_elements: usize) -> Vec<f32> {
     out
 }
 
+fn dequant_q8_0(data: &[u8], n_elements: usize) -> Vec<f32> {
+    let n_blocks = n_elements / 32;
+    let mut out = vec![0.0f32; n_elements];
+    for bi in 0..n_blocks {
+        let b = &data[bi * 34..];
+        let d = f16_to_f32(u16::from_le_bytes([b[0], b[1]]));
+        for j in 0..32usize { out[bi*32+j] = d * (b[2+j] as i8 as f32); }
+    }
+    out
+}
+
+fn dequant_q5_0(data: &[u8], n_elements: usize) -> Vec<f32> {
+    let n_blocks = n_elements / 32;
+    let mut out = vec![0.0f32; n_elements];
+    for bi in 0..n_blocks {
+        let b = &data[bi * 22..];
+        let d = f16_to_f32(u16::from_le_bytes([b[0], b[1]]));
+        let qh = u32::from_le_bytes([b[2], b[3], b[4], b[5]]);
+        for j in 0..32usize {
+            let qi_lo = if j < 16 { b[6+j] & 0xF } else { (b[6+j-16] >> 4) & 0xF };
+            let qh_bit = ((qh >> j) & 1) as u8;
+            let qi = (qi_lo | (qh_bit << 4)) as i32 - 16;
+            out[bi*32+j] = d * qi as f32;
+        }
+    }
+    out
+}
+
 fn dequant_tensor_f32(gguf: &GGUFModel, name: &str) -> Vec<f32> {
     let info = gguf.tensor_infos.iter().find(|t| t.name == name)
         .unwrap_or_else(|| panic!("Tensor not found: {}", name));
@@ -545,6 +577,8 @@ fn dequant_tensor_f32(gguf: &GGUFModel, name: &str) -> Vec<f32> {
     match info.typ {
         0 => unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const f32, n_elements).to_vec() },
         1 => unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const u16, n_elements).iter().map(|&b| f16_to_f32(b)).collect() },
+        6 => dequant_q5_0(bytes, n_elements),
+        8 => dequant_q8_0(bytes, n_elements),
         12 => dequant_q4_k(bytes, n_elements),
         13 => dequant_q5_k(bytes, n_elements),
         14 => dequant_q6_k(bytes, n_elements),
@@ -602,19 +636,24 @@ unsafe fn gpu_matmul_kquant(
     k: u32, n: u32,
 ) {
     upload(buf_a, a);
-    let push: [u32; 2] = [k, n];
-    let pb: Vec<u8> = push.iter().flat_map(|v| v.to_le_bytes()).collect();
-    let weight_bytes = (n as u64 / 256) * (k as u64) / 256 * (qtype.block_bytes() as u64) * 256;
-    // Actually: blocks_per_row = K/256, rows = N, total blocks = N * K/256
-    let blocks_per_row = k as u64 / 256;
-    let total_weight_bytes = n as u64 * blocks_per_row * qtype.block_bytes() as u64;
-    engine.dispatch_by_name(
-        qtype.shader_name(),
-        &[buf_a, weight_buf, buf_c],
-        &[k as u64 * 4, total_weight_bytes, n as u64 * 4],
-        &pb,
-        [qtype.workgroups(n), 1, 1],
-    );
+    if matches!(qtype, QType::F32) {
+        // F32 path: use matmul_tiled with M=1
+        let push: [u32; 3] = [1, k, n];
+        let pb: Vec<u8> = push.iter().flat_map(|v| v.to_le_bytes()).collect();
+        engine.dispatch_by_name("matmul_tiled",
+            &[buf_a, weight_buf, buf_c],
+            &[k as u64 * 4, k as u64 * n as u64 * 4, n as u64 * 4],
+            &pb, [(n + 15) / 16, 1, 1]);
+    } else {
+        let push: [u32; 2] = [k, n];
+        let pb: Vec<u8> = push.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let blocks_per_row = k as u64 / 256;
+        let total_weight_bytes = n as u64 * blocks_per_row * qtype.block_bytes() as u64;
+        engine.dispatch_by_name(qtype.shader_name(),
+            &[buf_a, weight_buf, buf_c],
+            &[k as u64 * 4, total_weight_bytes, n as u64 * 4],
+            &pb, [qtype.workgroups(n), 1, 1]);
+    }
     download(buf_c, c);
 }
 
@@ -682,7 +721,7 @@ impl Phi4Model {
         engine.get_pipeline("matmul_q6k", 3, 8);
         engine.get_pipeline("matmul_tiled", 3, 12);
         engine.get_pipeline("rmsnorm", 3, 8);
-        engine.get_pipeline("attention", 4, 12);
+        engine.get_pipeline("attention", 4, 16);  // 4 push u32s: seq_len, n_kv_heads, heads_per_kv, head_dim
         engine.get_pipeline("fused_norm_matmul_q4k", 4, 8);
         engine.get_pipeline("fused_norm_matmul_q5k", 4, 8);
         engine.get_pipeline("fused_norm_matmul_q6k", 4, 8);
@@ -714,6 +753,15 @@ impl Phi4Model {
                 QType::Q4K => (repack_q4k(raw_bytes, n_elements), QType::GPUQ4),
                 QType::Q5K => (repack_q5k(raw_bytes, n_elements), QType::GPUQ5),
                 QType::Q6K => (repack_q6k(raw_bytes, n_elements), QType::GPUQ6),
+                QType::F32 => {
+                    // Non-K-quant type — dequant to F32 for matmul_tiled shader
+                    // Transpose to [K, N] row-major for matmul_tiled (which expects B[K*N])
+                    let f32_data = dequant_tensor_f32(gguf, name);
+                    // GGUF stores [ne0=K, ne1=N] row-major. matmul_tiled expects column-major B[K,N].
+                    // The data is already in the right layout: N rows of K elements each.
+                    let bytes: Vec<u8> = f32_data.iter().flat_map(|f| f.to_le_bytes()).collect();
+                    (bytes, QType::F32)
+                }
                 _ => (raw_bytes.to_vec(), gguf_qtype),
             };
             let buf = unsafe { engine.alloc_buffer(data.len() as u64) };
@@ -1069,7 +1117,7 @@ impl Phi4Model {
             .iter().flat_map(|v| v.to_le_bytes()).collect();
         let silu_push: Vec<u8> = [FFN_DIM as u32].iter().flat_map(|v| v.to_le_bytes()).collect();
         let resid_push: Vec<u8> = [d].iter().flat_map(|v| v.to_le_bytes()).collect();
-        let attn_push: Vec<u8> = [seq_len, N_KV_HEADS as u32, heads_per_kv as u32]
+        let attn_push: Vec<u8> = [seq_len, N_KV_HEADS as u32, heads_per_kv as u32, HEAD_DIM as u32]
             .iter().flat_map(|v| v.to_le_bytes()).collect();
 
         // 11 dispatches per layer: rmsnorm, qkv, rope_kv_store, attn, out_proj, resid, rmsnorm, ffn_up, silu, ffn_down, resid
@@ -1255,7 +1303,7 @@ impl Phi4Model {
 
                 // GPU attention + output projection
                 upload(&self.attn_q_buf, &q);
-                let attn_push: Vec<u8> = [seq_len as u32, N_KV_HEADS as u32, heads_per_kv as u32]
+                let attn_push: Vec<u8> = [seq_len as u32, N_KV_HEADS as u32, heads_per_kv as u32, HEAD_DIM as u32]
                     .iter().flat_map(|v| v.to_le_bytes()).collect();
                 let kv_bytes = (seq_len * kv_stride) as u64 * 2; // f16
                 engine.dispatch_by_name("attention",
@@ -1417,7 +1465,7 @@ impl Phi4Model {
         let rope_kv_push: Vec<u8> = [pos as u32, N_HEADS as u32, N_KV_HEADS as u32, HEAD_DIM as u32, ROPE_DIM as u32,
             (N_HEADS * HEAD_DIM) as u32, (N_KV_HEADS * HEAD_DIM) as u32]
             .iter().flat_map(|v| v.to_le_bytes()).collect();
-        let attn_push: Vec<u8> = [seq_len, N_KV_HEADS as u32, heads_per_kv as u32]
+        let attn_push: Vec<u8> = [seq_len, N_KV_HEADS as u32, heads_per_kv as u32, HEAD_DIM as u32]
             .iter().flat_map(|v| v.to_le_bytes()).collect();
         let silu_push: Vec<u8> = [FFN_DIM as u32].iter().flat_map(|v| v.to_le_bytes()).collect();
         let resid_push: Vec<u8> = [d].iter().flat_map(|v| v.to_le_bytes()).collect();
@@ -1632,7 +1680,7 @@ impl Phi4Model {
             // Attention
             let seq_len = pos + 1;
             upload(&self.attn_q_buf, &q);
-            let attn_push: Vec<u8> = [seq_len as u32, cfg.n_kv_heads as u32, heads_per_kv as u32]
+            let attn_push: Vec<u8> = [seq_len as u32, cfg.n_kv_heads as u32, heads_per_kv as u32, cfg.head_dim as u32]
                 .iter().flat_map(|v| v.to_le_bytes()).collect();
             let kv_bytes = (seq_len * kv_stride) as u64 * 2;
             engine.dispatch_by_name("attention",
@@ -1784,7 +1832,7 @@ impl Phi4Model {
             // ---- Batch 2: attention → output projection (dynamic desc, single submit) ----
             upload(&self.attn_q_buf, &q);
             let seq_len = pos + 1;
-            let attn_push: Vec<u8> = [seq_len as u32, N_KV_HEADS as u32, heads_per_kv as u32]
+            let attn_push: Vec<u8> = [seq_len as u32, N_KV_HEADS as u32, heads_per_kv as u32, HEAD_DIM as u32]
                 .iter().flat_map(|v| v.to_le_bytes()).collect();
             let kv_bytes = (seq_len * kv_stride) as u64 * 4;
             let out_push: Vec<u8> = [layer.attn_output_k, layer.attn_output_n]
@@ -1945,7 +1993,7 @@ impl Phi4Model {
                 let kv_stride = N_KV_HEADS * HEAD_DIM;
 
                 upload(&self.attn_q_buf, &qs[t]);
-                let attn_push: Vec<u8> = [seq_len as u32, N_KV_HEADS as u32, heads_per_kv as u32]
+                let attn_push: Vec<u8> = [seq_len as u32, N_KV_HEADS as u32, heads_per_kv as u32, HEAD_DIM as u32]
                     .iter().flat_map(|v| v.to_le_bytes()).collect();
                 let kv_bytes = (seq_len * kv_stride) as u64 * 4;
                 let (ref kbuf, ref vbuf) = self.kv_bufs[_li];

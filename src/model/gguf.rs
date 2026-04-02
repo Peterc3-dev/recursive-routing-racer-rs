@@ -178,10 +178,16 @@ impl GGUFModel {
         let byte_size = match info.typ {
             0 => n_elements * 4,   // F32
             1 => n_elements * 2,   // F16
+            2 => (n_elements / 32) * 18,   // Q4_0 (32 elems, 2B scale + 16B quants)
+            3 => (n_elements / 32) * 20,   // Q4_1
+            6 => (n_elements / 32) * 22,   // Q5_0 (32 elems, 2B scale + 4B qh + 16B qs)
+            7 => (n_elements / 32) * 24,   // Q5_1
+            8 => (n_elements / 32) * 34,   // Q8_0 (32 elems, 2B scale + 32B quants)
+            9 => (n_elements / 32) * 36,   // Q8_1
             12 => (n_elements / 256) * 144,  // Q4_K
             13 => (n_elements / 256) * 176,  // Q5_K
             14 => (n_elements / 256) * 210,  // Q6_K
-            _ => n_elements * 4,
+            _ => panic!("Unknown quant type {} for tensor {}", info.typ, name),
         };
         
         let start = self.data_offset as usize + info.offset as usize;
