@@ -31,6 +31,13 @@ impl QType {
             QType::GPUQ4 => "matmul_gpuq4", QType::GPUQ5 => "matmul_gpuq5", QType::GPUQ6 => "matmul_gpuq6",
         }
     }
+    fn batch_shader_name(&self) -> &str {
+        match self {
+            QType::Q4K | QType::GPUQ4 => "matmul_gpuq4_batch",
+            QType::Q5K | QType::GPUQ5 => "matmul_gpuq5_batch",
+            QType::Q6K | QType::GPUQ6 => "matmul_gpuq6_batch",
+        }
+    }
     fn fused_shader_name(&self) -> &str {
         match self {
             QType::Q4K | QType::GPUQ4 => "fused_norm_matmul_q4k",
@@ -499,6 +506,9 @@ impl Phi4Model {
         engine.get_pipeline("matmul_gpuq4", 3, 8);
         engine.get_pipeline("matmul_gpuq5", 3, 8);
         engine.get_pipeline("matmul_gpuq6", 3, 8);
+        engine.get_pipeline("matmul_gpuq4_batch", 3, 12);  // K, N, M
+        engine.get_pipeline("matmul_gpuq5_batch", 3, 12);
+        engine.get_pipeline("matmul_gpuq6_batch", 3, 12);
         engine.get_pipeline("rope", 2, 20);
         engine.get_pipeline("rope_kv_store", 4, 28);  // 7 push u32s          // 5 push u32s = 20 bytes
         engine.get_pipeline("silu_gate", 2, 4);      // 1 push u32
@@ -876,6 +886,255 @@ impl Phi4Model {
             let src = std::slice::from_raw_parts(self.logit_out_bufs[i].mapped as *const f32, n);
             logits[vocab_offset as usize..(vocab_offset as usize + n)].copy_from_slice(src);
             vocab_offset += n as u32;
+        }
+        logits
+    }
+
+    /// Batched prefill: process M tokens per layer, batching matmuls to share weight reads.
+    /// Weight data loaded once per matmul instead of M times. ~80% bandwidth savings for M=5.
+    pub unsafe fn forward_prefill_batched(
+        &self, engine: &ComputeEngine, token_ids: &[u32], cache: &mut KVCache,
+    ) -> Vec<f32> {
+        let base_pos = cache.len;
+        let m = token_ids.len();
+        let heads_per_kv = N_HEADS / N_KV_HEADS;
+        let d = D_MODEL as u32;
+        let kv_stride = N_KV_HEADS * HEAD_DIM;
+        let norm_push: Vec<u8> = [1u32, d].iter().flat_map(|v| v.to_le_bytes()).collect();
+        let kv_max_bytes = (MAX_SEQ * kv_stride) as u64 * 2;
+
+        // Embed all tokens
+        let mut hiddens: Vec<Vec<f32>> = token_ids.iter().map(|&t| self.embed(t)).collect();
+
+        // Allocate batch GPU buffers (M copies)
+        let buf_hiddens = engine.alloc_buffer((m * D_MODEL) as u64 * 4);
+        let buf_normed = engine.alloc_buffer((m * D_MODEL) as u64 * 4);
+        let buf_qkv = engine.alloc_buffer((m * QKV_DIM) as u64 * 4);
+        let buf_gate_up = engine.alloc_buffer((m * GATE_UP_DIM) as u64 * 4);
+        let buf_ffn_mid = engine.alloc_buffer((m * FFN_DIM) as u64 * 4);
+        let buf_tmp = engine.alloc_buffer((m * D_MODEL) as u64 * 4);
+
+        for (_li, layer) in self.layers.iter().enumerate() {
+            let (ref kbuf, ref vbuf) = self.kv_bufs[_li];
+            let bpr_qkv = layer.attn_qkv_k as u64 / 256;
+            let wb_qkv = layer.attn_qkv_n as u64 * bpr_qkv * layer.attn_qkv_type.block_bytes() as u64;
+            let bpr_out = layer.attn_output_k as u64 / 256;
+            let wb_out = layer.attn_output_n as u64 * bpr_out * layer.attn_output_type.block_bytes() as u64;
+            let bpr_up = layer.ffn_up_k as u64 / 256;
+            let wb_up = layer.ffn_up_n as u64 * bpr_up * layer.ffn_up_type.block_bytes() as u64;
+            let bpr_dn = layer.ffn_down_k as u64 / 256;
+            let wb_dn = layer.ffn_down_n as u64 * bpr_dn * layer.ffn_down_type.block_bytes() as u64;
+
+            // Upload all M hidden states
+            for t in 0..m {
+                let off = t * D_MODEL * 4;
+                std::ptr::copy_nonoverlapping(
+                    hiddens[t].as_ptr() as *const u8,
+                    (buf_hiddens.mapped as *mut u8).add(off), D_MODEL * 4);
+            }
+
+            // RMS norm: M separate dispatches (different hidden states)
+            for t in 0..m {
+                let t_off = (t * D_MODEL) as u64 * 4;
+                // Use buf_a/buf_c as temp, norm each token separately
+                let h_slice = &hiddens[t];
+                upload(&self.buf_a, h_slice);
+                let pb = norm_push.clone();
+                engine.dispatch_by_name("rmsnorm",
+                    &[&self.buf_a, &layer.attn_norm_buf, &self.buf_c],
+                    &[d as u64*4, d as u64*4, d as u64*4], &pb, [1,1,1]);
+                // Copy normed result into batch buffer at token t's slot
+                std::ptr::copy_nonoverlapping(
+                    self.buf_c.mapped as *const u8,
+                    (buf_normed.mapped as *mut u8).add(t * D_MODEL * 4), D_MODEL * 4);
+            }
+
+            // Batched QKV matmul: [M, K] × W → [M, N], ONE dispatch for all tokens
+            {
+                let push: Vec<u8> = [layer.attn_qkv_k, layer.attn_qkv_n, m as u32]
+                    .iter().flat_map(|v| v.to_le_bytes()).collect();
+                engine.dispatch_by_name(
+                    layer.attn_qkv_type.batch_shader_name(),
+                    &[&buf_normed, &layer.attn_qkv_buf, &buf_qkv],
+                    &[(m * D_MODEL) as u64 * 4, wb_qkv, (m * QKV_DIM) as u64 * 4],
+                    &push,
+                    [layer.attn_qkv_type.workgroups(layer.attn_qkv_n), m as u32, 1],
+                );
+            }
+
+            // Per-token: RoPE + KV store + attention
+            for t in 0..m {
+                let pos = base_pos + t;
+                let seq_len = pos + 1;
+
+                // Download this token's QKV, apply RoPE, store KV, run attention
+                let mut qkv = vec![0.0f32; QKV_DIM];
+                std::ptr::copy_nonoverlapping(
+                    (buf_qkv.mapped as *const u8).add(t * QKV_DIM * 4),
+                    qkv.as_mut_ptr() as *mut u8, QKV_DIM * 4);
+
+                // Upload QKV back to GPU for RoPE + KV store (f32→f16 packing)
+                upload(&self.gpu_qkv, &qkv);
+
+                // GPU: RoPE + KV store (f16 packing on GPU)
+                let rope_kv_push: Vec<u8> = [pos as u32, N_HEADS as u32, N_KV_HEADS as u32,
+                    HEAD_DIM as u32, ROPE_DIM as u32, (N_HEADS * HEAD_DIM) as u32, kv_stride as u32]
+                    .iter().flat_map(|v| v.to_le_bytes()).collect();
+                let fused_wg = {
+                    let rope_pairs = (N_HEADS + N_KV_HEADS) * (ROPE_DIM / 2);
+                    let half_kv = kv_stride / 2;
+                    ((std::cmp::max(rope_pairs, half_kv) + 63) / 64) as u32
+                };
+                engine.dispatch_by_name("rope_kv_store",
+                    &[&self.gpu_qkv, &self.gpu_rope_factors, kbuf, vbuf],
+                    &[QKV_DIM as u64*4, (ROPE_DIM as u64/2)*4, kv_max_bytes, kv_max_bytes],
+                    &rope_kv_push, [fused_wg, 1, 1]);
+
+                // Read back Q for attention (post-RoPE)
+                let mut q = vec![0.0f32; N_HEADS * HEAD_DIM];
+                std::ptr::copy_nonoverlapping(
+                    self.gpu_qkv.mapped as *const u8,
+                    q.as_mut_ptr() as *mut u8, (N_HEADS * HEAD_DIM) * 4);
+
+                // GPU attention + output projection
+                upload(&self.attn_q_buf, &q);
+                let attn_push: Vec<u8> = [seq_len as u32, N_KV_HEADS as u32, heads_per_kv as u32]
+                    .iter().flat_map(|v| v.to_le_bytes()).collect();
+                let kv_bytes = (seq_len * kv_stride) as u64 * 2; // f16
+                engine.dispatch_by_name("attention",
+                    &[&self.attn_q_buf, kbuf, vbuf, &self.attn_out_buf],
+                    &[D_MODEL as u64*4, kv_bytes, kv_bytes, D_MODEL as u64*4],
+                    &attn_push, [N_HEADS as u32, 1, 1]);
+
+                // Output projection → tmp
+                let out_push: Vec<u8> = [layer.attn_output_k, layer.attn_output_n]
+                    .iter().flat_map(|v| v.to_le_bytes()).collect();
+                engine.dispatch_by_name(layer.attn_output_type.shader_name(),
+                    &[&self.attn_out_buf, &layer.attn_output_buf, &self.buf_c],
+                    &[layer.attn_output_k as u64*4, wb_out, layer.attn_output_n as u64*4],
+                    &out_push, [layer.attn_output_type.workgroups(layer.attn_output_n), 1, 1]);
+
+                // Download tmp, add residual
+                let mut tmp = vec![0.0f32; D_MODEL];
+                download(&self.buf_c, &mut tmp);
+                for i in 0..D_MODEL { hiddens[t][i] += tmp[i]; }
+            }
+
+            // Upload all M updated hidden states for FFN norm
+            for t in 0..m {
+                std::ptr::copy_nonoverlapping(
+                    hiddens[t].as_ptr() as *const u8,
+                    (buf_hiddens.mapped as *mut u8).add(t * D_MODEL * 4), D_MODEL * 4);
+            }
+
+            // RMS norm (FFN): M separate dispatches
+            for t in 0..m {
+                upload(&self.buf_a, &hiddens[t]);
+                engine.dispatch_by_name("rmsnorm",
+                    &[&self.buf_a, &layer.ffn_norm_buf, &self.buf_c],
+                    &[d as u64*4, d as u64*4, d as u64*4], &norm_push, [1,1,1]);
+                std::ptr::copy_nonoverlapping(
+                    self.buf_c.mapped as *const u8,
+                    (buf_normed.mapped as *mut u8).add(t * D_MODEL * 4), D_MODEL * 4);
+            }
+
+            // Batched FFN up matmul
+            {
+                let push: Vec<u8> = [layer.ffn_up_k, layer.ffn_up_n, m as u32]
+                    .iter().flat_map(|v| v.to_le_bytes()).collect();
+                engine.dispatch_by_name(
+                    layer.ffn_up_type.batch_shader_name(),
+                    &[&buf_normed, &layer.ffn_up_buf, &buf_gate_up],
+                    &[(m * D_MODEL) as u64*4, wb_up, (m * GATE_UP_DIM) as u64*4],
+                    &push,
+                    [layer.ffn_up_type.workgroups(layer.ffn_up_n), m as u32, 1],
+                );
+            }
+
+            // Per-token SiLU + gate*up
+            let mut all_ffn_mid = vec![0.0f32; m * FFN_DIM];
+            {
+                let mut all_gate_up = vec![0.0f32; m * GATE_UP_DIM];
+                std::ptr::copy_nonoverlapping(
+                    buf_gate_up.mapped as *const u8,
+                    all_gate_up.as_mut_ptr() as *mut u8, m * GATE_UP_DIM * 4);
+                for t in 0..m {
+                    let go = t * GATE_UP_DIM;
+                    let fo = t * FFN_DIM;
+                    for i in 0..FFN_DIM {
+                        let gate = all_gate_up[go + i];
+                        let silu = gate / (1.0 + (-gate).exp());
+                        all_ffn_mid[fo + i] = silu * all_gate_up[go + FFN_DIM + i];
+                    }
+                }
+                std::ptr::copy_nonoverlapping(
+                    all_ffn_mid.as_ptr() as *const u8,
+                    buf_ffn_mid.mapped as *mut u8, m * FFN_DIM * 4);
+            }
+
+            // Batched FFN down matmul
+            {
+                let push: Vec<u8> = [layer.ffn_down_k, layer.ffn_down_n, m as u32]
+                    .iter().flat_map(|v| v.to_le_bytes()).collect();
+                engine.dispatch_by_name(
+                    layer.ffn_down_type.batch_shader_name(),
+                    &[&buf_ffn_mid, &layer.ffn_down_buf, &buf_tmp],
+                    &[(m * FFN_DIM) as u64*4, wb_dn, (m * D_MODEL) as u64*4],
+                    &push,
+                    [layer.ffn_down_type.workgroups(layer.ffn_down_n), m as u32, 1],
+                );
+            }
+
+            // Download FFN results, add residual
+            {
+                let mut all_tmp = vec![0.0f32; m * D_MODEL];
+                std::ptr::copy_nonoverlapping(
+                    buf_tmp.mapped as *const u8,
+                    all_tmp.as_mut_ptr() as *mut u8, m * D_MODEL * 4);
+                for t in 0..m {
+                    let to = t * D_MODEL;
+                    for i in 0..D_MODEL { hiddens[t][i] += all_tmp[to + i]; }
+                }
+            }
+        }
+
+        cache.len += m;
+
+        // Logits for last token
+        let hidden = &hiddens[m - 1];
+        let mut norm = vec![0.0f32; D_MODEL];
+        rms_norm(hidden, &self.output_norm, &mut norm);
+        upload(&self.buf_a, &norm);
+
+        let mk = 1u32;
+        let kk = D_MODEL as u32;
+        let mut dispatches_data: Vec<(Vec<u8>, [u32; 3], usize)> = Vec::new();
+        for (i, (_, chunk_n)) in self.emb_bufs.iter().enumerate() {
+            let n = *chunk_n as u32;
+            let push: [u32; 3] = [mk, kk, n];
+            let pb: Vec<u8> = push.iter().flat_map(|v| v.to_le_bytes()).collect();
+            dispatches_data.push((pb, [(n + 15) / 16, (mk + 15) / 16, 1], i));
+        }
+        let dispatches: Vec<(&str, Vec<&GpuBuffer>, Vec<u64>, &[u8], [u32; 3])> = dispatches_data.iter()
+            .map(|(pb, groups, i)| {
+                let n = self.emb_bufs[*i].1;
+                ("matmul_tiled",
+                 vec![&self.buf_a, &self.emb_bufs[*i].0, &self.logit_out_bufs[*i]],
+                 vec![(mk as u64)*(kk as u64)*4, (kk as u64)*(n as u64)*4, (mk as u64)*(n as u64)*4],
+                 pb.as_slice(), *groups)
+            }).collect();
+        let dispatch_refs: Vec<(&str, &[&GpuBuffer], &[u64], &[u8], [u32; 3])> = dispatches.iter()
+            .map(|(name, bufs, sizes, push, groups)| (*name, bufs.as_slice(), sizes.as_slice(), *push, *groups))
+            .collect();
+        engine.dispatch_batch_parallel(&dispatch_refs);
+
+        let mut logits = vec![0.0f32; VOCAB_SIZE];
+        let mut vocab_offset = 0usize;
+        for (i, (_, chunk_n)) in self.emb_bufs.iter().enumerate() {
+            let n = *chunk_n;
+            let src = std::slice::from_raw_parts(self.logit_out_bufs[i].mapped as *const f32, n);
+            logits[vocab_offset..vocab_offset + n].copy_from_slice(src);
+            vocab_offset += n;
         }
         logits
     }

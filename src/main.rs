@@ -30,11 +30,7 @@ fn main() {
             let mut cache = model::KVCache::new();
 
             let pt = Instant::now();
-            let mut logits = Vec::new();
-            for &tok in &prompt_tokens {
-                let mut h = phi4.embed(tok);
-                logits = phi4.forward_gpu(&engine, &mut h, &mut cache);
-            }
+            let mut logits = phi4.forward_prefill_batched(&engine, &prompt_tokens, &mut cache);
             eprintln!("[prefill {}ms, {} tokens]", pt.elapsed().as_millis(), prompt_tokens.len());
 
             let gt = Instant::now();
@@ -84,11 +80,8 @@ fn main() {
                 if prompt_tokens.is_empty() { continue; }
 
                 let pt = Instant::now();
-                let mut logits = Vec::new();
-                for &tok in &prompt_tokens {
-                    let mut h = phi4.embed(tok);
-                    logits = phi4.forward_gpu(&engine, &mut h, &mut cache);
-                }
+                let mut logits = phi4.forward_prefill_batched(&engine, &prompt_tokens, &mut cache);
+                let mut logits = logits;
                 let prefill_ms = pt.elapsed().as_millis();
                 eprint!("\x1b[90m[prefill {}ms, {} tokens]\x1b[0m ", prefill_ms, prompt_tokens.len());
                 std::io::stdout().flush().unwrap();
