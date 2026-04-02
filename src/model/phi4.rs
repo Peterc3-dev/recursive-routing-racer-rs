@@ -1,11 +1,106 @@
-//! Phi-4 Mini forward pass — native K-quant shaders (Q4_K/Q5_K/Q6_K).
-//! Route 4: Read GGUF blocks directly in shader. Zero requantization loss.
-//! ~1.4GB GPU for 32 layers.
+//! Dynamic transformer forward pass — supports Phi-3/4, Qwen2, LLaMA architectures.
+//! Native K-quant shaders (Q4_K/Q5_K/Q6_K) with GPU-native repack.
 
 use crate::gpu::{ComputeEngine, GpuBuffer, DescSetHandle};
 use crate::model::gguf::GGUFModel;
 use std::time::Instant;
 
+/// Dynamic model configuration — read from GGUF metadata at load time.
+#[derive(Clone)]
+pub struct ModelConfig {
+    pub arch: String,          // "phi3", "qwen2", "llama", etc.
+    pub d_model: usize,
+    pub n_heads: usize,
+    pub n_kv_heads: usize,
+    pub head_dim: usize,
+    pub ffn_dim: usize,
+    pub n_layers: usize,
+    pub vocab_size: usize,
+    pub rms_eps: f32,
+    pub rope_dim: usize,       // partial rotation dims (= head_dim for most models)
+    pub rope_theta: f32,
+    pub rope_attn_factor: f32, // 1.0 for standard RoPE, >1 for LongRoPE
+    pub has_qkv_bias: bool,
+    pub has_rope_factors: bool,
+    pub separate_qkv: bool,    // true for Qwen2 (separate Q/K/V tensors)
+    pub separate_gate_up: bool, // true for Qwen2 (separate gate + up tensors)
+    pub has_output_weight: bool, // true if output.weight exists (not tied to embedding)
+}
+
+impl ModelConfig {
+    pub fn from_gguf(gguf: &GGUFModel) -> Self {
+        // Detect architecture
+        let arch = gguf.metadata.get("general.architecture")
+            .and_then(|v| v.as_str()).unwrap_or("llama").to_string();
+        let prefix = arch.clone();
+
+        let get_u32 = |key: &str| -> u32 {
+            gguf.metadata.get(&format!("{}.{}", prefix, key))
+                .and_then(|v| v.as_u64()).unwrap_or(0) as u32
+        };
+        let get_f32 = |key: &str| -> f32 {
+            gguf.metadata.get(&format!("{}.{}", prefix, key))
+                .and_then(|v| v.as_f32()).unwrap_or(0.0)
+        };
+
+        let d_model = get_u32("embedding_length") as usize;
+        let n_heads = get_u32("attention.head_count") as usize;
+        let n_kv_heads = get_u32("attention.head_count_kv") as usize;
+        let head_dim = if n_heads > 0 { d_model / n_heads } else { 128 };
+        let ffn_dim = get_u32("feed_forward_length") as usize;
+        let n_layers = get_u32("block_count") as usize;
+        let rms_eps = get_f32("attention.layer_norm_rms_epsilon");
+        let rms_eps = if rms_eps > 0.0 { rms_eps } else { 1e-5 };
+        let rope_dim = {
+            let rd = get_u32("rope.dimension_count") as usize;
+            if rd > 0 { rd } else { head_dim }  // default: full rotation
+        };
+        let rope_theta = {
+            let rt = get_f32("rope.freq_base");
+            if rt > 0.0 { rt } else { 10000.0 }
+        };
+        let rope_attn_factor = {
+            let af = get_f32("rope.scaling.attn_factor");
+            if af > 0.0 { af } else { 1.0 }  // 1.0 = standard RoPE, no scaling
+        };
+
+        // Detect tensor patterns
+        let has_qkv_combined = gguf.tensor_infos.iter().any(|t| t.name == "blk.0.attn_qkv.weight");
+        let has_separate_qkv = gguf.tensor_infos.iter().any(|t| t.name == "blk.0.attn_q.weight");
+        let has_gate = gguf.tensor_infos.iter().any(|t| t.name == "blk.0.ffn_gate.weight");
+        let has_qkv_bias = gguf.tensor_infos.iter().any(|t| t.name == "blk.0.attn_q.bias");
+        let has_rope_factors = gguf.tensor_infos.iter().any(|t| t.name.contains("rope_factors"));
+        let has_output_weight = gguf.tensor_infos.iter().any(|t| t.name == "output.weight");
+
+        let vocab_size = gguf.tensor_infos.iter()
+            .find(|t| t.name == "token_embd.weight")
+            .map(|t| t.shape[1] as usize).unwrap_or(0);
+
+        let qkv_dim = n_heads * head_dim + 2 * n_kv_heads * head_dim;
+        let gate_up_dim = 2 * ffn_dim;
+
+        eprintln!("[config] arch={} d_model={} n_heads={} n_kv_heads={} head_dim={} ffn_dim={} \
+            n_layers={} vocab={} rope_dim={} rope_theta={:.0} attn_factor={:.3}",
+            arch, d_model, n_heads, n_kv_heads, head_dim, ffn_dim,
+            n_layers, vocab_size, rope_dim, rope_theta, rope_attn_factor);
+        eprintln!("[config] separate_qkv={} separate_gate_up={} qkv_bias={} rope_factors={} output_weight={}",
+            has_separate_qkv, has_gate, has_qkv_bias, has_rope_factors, has_output_weight);
+
+        ModelConfig {
+            arch, d_model, n_heads, n_kv_heads, head_dim, ffn_dim, n_layers, vocab_size,
+            rms_eps, rope_dim, rope_theta, rope_attn_factor,
+            has_qkv_bias, has_rope_factors,
+            separate_qkv: has_separate_qkv && !has_qkv_combined,
+            separate_gate_up: has_gate,
+            has_output_weight,
+        }
+    }
+
+    pub fn qkv_dim(&self) -> usize { self.n_heads * self.head_dim + 2 * self.n_kv_heads * self.head_dim }
+    pub fn gate_up_dim(&self) -> usize { 2 * self.ffn_dim }
+}
+
+// Legacy constants — used by code not yet migrated to ModelConfig
 const D_MODEL: usize = 3072;
 const N_HEADS: usize = 24;
 const N_KV_HEADS: usize = 8;
@@ -16,9 +111,9 @@ const VOCAB_SIZE: usize = 200064;
 const RMS_EPS: f32 = 1e-5;
 const QKV_DIM: usize = N_HEADS * HEAD_DIM + 2 * N_KV_HEADS * HEAD_DIM;
 const GATE_UP_DIM: usize = 2 * FFN_DIM;
-
 const ROPE_DIM: usize = 96;
 const ROPE_THETA: f32 = 10000.0;
+const ROPE_ATTN_FACTOR: f32 = 1.190238;
 
 /// Quant type determines which shader + block size to use
 #[derive(Clone, Copy)]
@@ -57,19 +152,26 @@ impl QType {
     }
 }
 
-/// Per-layer weights — raw GGUF K-quant bytes on GPU
+/// Per-layer weights — raw GGUF K-quant bytes on GPU (GPU-native repacked)
 pub struct LayerWeights {
     pub attn_norm_buf: GpuBuffer,
     pub ffn_norm_buf: GpuBuffer,
+    // QKV: either combined (Phi-4) or separate Q+K+V (Qwen2)
+    // For separate: attn_qkv_buf holds Q, attn_k_buf/attn_v_buf hold K/V
     pub attn_qkv_buf: GpuBuffer,     pub attn_qkv_type: QType,     pub attn_qkv_k: u32,   pub attn_qkv_n: u32,
+    pub attn_k_buf: Option<(GpuBuffer, QType, u32, u32)>,  // K weight (separate QKV only)
+    pub attn_v_buf: Option<(GpuBuffer, QType, u32, u32)>,  // V weight (separate QKV only)
     pub attn_output_buf: GpuBuffer,   pub attn_output_type: QType,  pub attn_output_k: u32, pub attn_output_n: u32,
+    // FFN: either combined gate+up (Phi-4) or separate gate + up (Qwen2)
     pub ffn_up_buf: GpuBuffer,        pub ffn_up_type: QType,       pub ffn_up_k: u32,      pub ffn_up_n: u32,
+    pub ffn_gate_buf: Option<(GpuBuffer, QType, u32, u32)>,  // gate weight (separate only)
     pub ffn_down_buf: GpuBuffer,      pub ffn_down_type: QType,     pub ffn_down_k: u32,    pub ffn_down_n: u32,
-    // Persistent descriptor set handles (pre-allocated at load time)
-    pub ds_norm_qkv: (DescSetHandle, DescSetHandle),    // rmsnorm, QKV matmul
-    pub ds_out_proj: DescSetHandle,                      // output projection matmul
-    pub ds_norm_ffnup: (DescSetHandle, DescSetHandle),  // rmsnorm, FFN up matmul
-    pub ds_ffn_down: DescSetHandle,                      // FFN down matmul
+    pub qkv_bias: Option<Vec<f32>>,
+    // Persistent descriptor set handles
+    pub ds_norm_qkv: (DescSetHandle, DescSetHandle),
+    pub ds_out_proj: DescSetHandle,
+    pub ds_norm_ffnup: (DescSetHandle, DescSetHandle),
+    pub ds_ffn_down: DescSetHandle,
 }
 
 const MAX_SEQ: usize = 2048;
@@ -83,6 +185,7 @@ pub struct PrebuiltDispatch {
 }
 
 pub struct Phi4Model {
+    pub config: ModelConfig,
     pub embedding: Vec<f32>,
     pub output_norm: Vec<f32>,
     pub layers: Vec<LayerWeights>,
@@ -127,8 +230,6 @@ impl KVCache {
         }
     }
 }
-
-const ROPE_ATTN_FACTOR: f32 = 1.190238;  // phi3.rope.scaling.attn_factor
 
 fn apply_rope(x: &mut [f32], pos: usize, n_heads: usize, rope_factors: &[f32]) {
     for h in 0..n_heads {
@@ -486,11 +587,16 @@ unsafe fn gpu_rmsnorm(
 impl Phi4Model {
     pub unsafe fn load_from_gguf(gguf: &GGUFModel, engine: &mut ComputeEngine) -> Self {
         let t0 = Instant::now();
+        let config = ModelConfig::from_gguf(gguf);
 
-        eprintln!("[phi4] Loading embedding...");
+        eprintln!("[load] Loading embedding...");
         let embedding = dequant_tensor_f32(gguf, "token_embd.weight");
         let output_norm = dequant_tensor_f32(gguf, "output_norm.weight");
-        let rope_factors = dequant_tensor_f32(gguf, "rope_factors_short.weight");
+        let rope_factors = if config.has_rope_factors {
+            dequant_tensor_f32(gguf, "rope_factors_short.weight")
+        } else {
+            vec![]  // standard RoPE, no factors
+        };
         eprintln!("[phi4] Embedding + norms: {:.1}s", t0.elapsed().as_secs_f32());
 
         // Register pipelines
@@ -559,9 +665,12 @@ impl Phi4Model {
             layers.push(LayerWeights {
                 attn_norm_buf, ffn_norm_buf,
                 attn_qkv_buf: qkv_buf, attn_qkv_type: qkv_t, attn_qkv_k: qkv_k, attn_qkv_n: qkv_n,
+                attn_k_buf: None, attn_v_buf: None,
                 attn_output_buf: out_buf, attn_output_type: out_t, attn_output_k: out_k, attn_output_n: out_n,
                 ffn_up_buf: up_buf, ffn_up_type: up_t, ffn_up_k: up_k, ffn_up_n: up_n,
+                ffn_gate_buf: None,
                 ffn_down_buf: down_buf, ffn_down_type: down_t, ffn_down_k: down_k, ffn_down_n: down_n,
+                qkv_bias: None,
                 ds_norm_qkv: (DescSetHandle(0), DescSetHandle(0)),
                 ds_out_proj: DescSetHandle(0),
                 ds_norm_ffnup: (DescSetHandle(0), DescSetHandle(0)),
@@ -769,7 +878,7 @@ impl Phi4Model {
         eprintln!("[phi4] Ready: {:.1}s, {:.1}MB total GPU ({} pre-built dispatches)",
             t0.elapsed().as_secs_f32(), total_gpu as f64 / 1e6, mega_dispatches.len());
 
-        Phi4Model { embedding, output_norm, layers, buf_a, buf_c, logits_buf, emb_bufs, rope_factors,
+        Phi4Model { config, embedding, output_norm, layers, buf_a, buf_c, logits_buf, emb_bufs, rope_factors,
                     attn_q_buf, attn_out_buf, kv_bufs, logit_out_bufs,
                     gpu_hidden, gpu_normed, gpu_qkv, gpu_gate_up, gpu_ffn_mid, gpu_tmp, gpu_rope_factors,
                     mega_dispatches, gpu_output_norm_w, gpu_logits, gpu_argmax_scratch, gpu_argmax_result }
