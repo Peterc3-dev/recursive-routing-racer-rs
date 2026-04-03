@@ -196,12 +196,14 @@ pub struct Phi4Model {
     pub buf_a: GpuBuffer,
     pub buf_c: GpuBuffer,
     pub logits_buf: GpuBuffer,
-    pub emb_bufs: Vec<(GpuBuffer, usize)>,
+    pub emb_bufs: Vec<(GpuBuffer, usize)>,   // legacy F32 chunks (unused when gpu_output_weight is set)
     pub rope_factors: Vec<f32>,
     pub attn_q_buf: GpuBuffer,
     pub attn_out_buf: GpuBuffer,
     pub kv_bufs: Vec<(GpuBuffer, GpuBuffer)>,
-    pub logit_out_bufs: Vec<GpuBuffer>,
+    pub logit_out_bufs: Vec<GpuBuffer>,       // legacy (unused when gpu_output_weight is set)
+    pub gpu_output_weight: Option<(GpuBuffer, QType, u32, u32)>,  // Q6_K logit weight on GPU
+    pub gpu_logit_out: Option<GpuBuffer>,     // [vocab_size] f32 logit output
     // GPU-resident pipeline buffers
     pub gpu_hidden: GpuBuffer,
     pub gpu_normed: GpuBuffer,
@@ -863,33 +865,62 @@ impl Phi4Model {
         let buf_c = engine.alloc_buffer((gate_up_dim as u64) * 4);
         let logits_buf = engine.alloc_buffer(8192 * 4);
 
-        // For logit projection: use output.weight if available, else use embedding (tied weights)
-        let output_weight = if config.has_output_weight {
-            eprintln!("[load] Loading separate output.weight...");
-            dequant_tensor_f32(gguf, "output.weight")
-        } else {
-            embedding.clone()  // tied weights
-        };
-
-        // F32 embedding chunks for logits (need transpose for matmul_tiled)
+        // For logit projection: load output weight in GPU-native quantized format
+        // Use output.weight if available, else token_embd.weight (tied weights)
         let d_model = config.d_model;
         let vocab_size = config.vocab_size;
-        let chunk_size: usize = 8192;
-        let mut emb_bufs = Vec::new();
-        let mut chunk_start = 0usize;
-        while chunk_start < vocab_size {
-            let chunk_end = (chunk_start + chunk_size).min(vocab_size);
-            let n = chunk_end - chunk_start;
-            let mut transposed = vec![0.0f32; d_model * n];
-            for d in 0..d_model {
-                for v in 0..n {
-                    transposed[d * n + v] = output_weight[(chunk_start + v) * d_model + d];
-                }
+        let output_weight_name = if config.has_output_weight { "output.weight" } else { "token_embd.weight" };
+        let output_info = gguf.tensor_infos.iter().find(|t| t.name == output_weight_name);
+        let (gpu_output_weight, gpu_logit_out) = if let Some(info) = output_info {
+            let gguf_qtype = QType::from_gguf(info.typ);
+            let is_quantized = matches!(gguf_qtype, QType::Q4K | QType::Q5K | QType::Q6K);
+            if is_quantized {
+                eprintln!("[load] Loading {} as GPU-native quantized logit weight...", output_weight_name);
+                let loaded = load_weight_gpu(gguf, engine, output_weight_name, &mut total_gpu);
+                let logit_out = engine.alloc_buffer(vocab_size as u64 * 4);
+                (Some(loaded), Some(logit_out))
+            } else {
+                (None, None)
             }
-            let buf = engine.alloc_buffer((d_model * n) as u64 * 4);
-            upload(&buf, &transposed);
-            emb_bufs.push((buf, n));
-            chunk_start = chunk_end;
+        } else {
+            (None, None)
+        };
+
+        // F32 embedding chunks — fallback for non-quantized output weights
+        let emb_bufs;
+        let logit_out_bufs;
+        if gpu_output_weight.is_some() {
+            emb_bufs = Vec::new();
+            logit_out_bufs = Vec::new();
+        } else {
+            let output_weight_f32 = if config.has_output_weight {
+                dequant_tensor_f32(gguf, "output.weight")
+            } else {
+                embedding.clone()
+            };
+            let chunk_size: usize = 8192;
+            let mut ebufs = Vec::new();
+            let mut chunk_start = 0usize;
+            while chunk_start < vocab_size {
+                let chunk_end = (chunk_start + chunk_size).min(vocab_size);
+                let n = chunk_end - chunk_start;
+                let mut transposed = vec![0.0f32; d_model * n];
+                for d in 0..d_model {
+                    for v in 0..n {
+                        transposed[d * n + v] = output_weight_f32[(chunk_start + v) * d_model + d];
+                    }
+                }
+                let buf = engine.alloc_buffer((d_model * n) as u64 * 4);
+                upload(&buf, &transposed);
+                ebufs.push((buf, n));
+                chunk_start = chunk_end;
+            }
+            let mut lobufs = Vec::with_capacity(ebufs.len());
+            for (_, n) in &ebufs {
+                lobufs.push(engine.alloc_buffer((*n as u64) * 4));
+            }
+            emb_bufs = ebufs;
+            logit_out_bufs = lobufs;
         }
         // GPU attention buffers
         let attn_q_buf = engine.alloc_buffer((d_model as u64) * 4);
@@ -903,13 +934,6 @@ impl Phi4Model {
             kv_bufs.push((kb, vb));
         }
         total_gpu += config.n_layers as u64 * kv_size * 2 + d_model as u64 * 4 * 2;
-
-        // Per-chunk logit output buffers for batched logits
-        let mut logit_out_bufs = Vec::with_capacity(emb_bufs.len());
-        for (_, n) in &emb_bufs {
-            let buf = engine.alloc_buffer((*n as u64) * 4);
-            logit_out_bufs.push(buf);
-        }
 
         // Pre-allocate persistent descriptor sets for each layer
         let d4 = d_model as u64 * 4;
@@ -1046,21 +1070,35 @@ impl Phi4Model {
                 pipeline_name: "rmsnorm".to_string(), desc_set: ds, workgroups: [1,1,1], needs_barrier: true,
             });
         }
-        // Logit matmul chunks: gpu_normed × emb_chunk → logit_out_bufs
+        // Logit projection: gpu_normed × output_weight → logit output
         if !mega_dispatches.is_empty() {
-        let mk = 1u32;
-        let kk = d_model as u32;
-        for (i, (emb_buf, chunk_n)) in emb_bufs.iter().enumerate() {
-            let n = *chunk_n as u32;
-            let ds = engine.pre_allocate_desc_set("matmul_tiled",
-                &[&gpu_normed, emb_buf, &logit_out_bufs[i]],
-                &[(mk as u64)*(kk as u64)*4, (kk as u64)*(n as u64)*4, (mk as u64)*(n as u64)*4]);
+        if let (Some(ref ow), Some(ref lo)) = (&gpu_output_weight, &gpu_logit_out) {
+            // GPU-native quantized logit projection — single dispatch
+            let (ref wbuf, qtype, k, n) = *ow;
+            let bpr = k as u64 / 256;
+            let wb = n as u64 * bpr * qtype.block_bytes() as u64;
+            let ds = engine.pre_allocate_desc_set(qtype.shader_name(),
+                &[&gpu_normed, wbuf, lo],
+                &[k as u64 * 4, wb, n as u64 * 4]);
             mega_dispatches.push(PrebuiltDispatch {
-                pipeline_name: "matmul_tiled".to_string(), desc_set: ds,
-                workgroups: [(n + 15) / 16, (mk + 15) / 16, 1], needs_barrier: false,
+                pipeline_name: qtype.shader_name().to_string(), desc_set: ds,
+                workgroups: [qtype.workgroups(n), 1, 1], needs_barrier: false,
             });
+        } else {
+            // F32 fallback: chunked matmul_tiled
+            let mk = 1u32;
+            let kk = d_model as u32;
+            for (i, (emb_buf, chunk_n)) in emb_bufs.iter().enumerate() {
+                let n = *chunk_n as u32;
+                let ds = engine.pre_allocate_desc_set("matmul_tiled",
+                    &[&gpu_normed, emb_buf, &logit_out_bufs[i]],
+                    &[(mk as u64)*(kk as u64)*4, (kk as u64)*(n as u64)*4, (mk as u64)*(n as u64)*4]);
+                mega_dispatches.push(PrebuiltDispatch {
+                    pipeline_name: "matmul_tiled".to_string(), desc_set: ds,
+                    workgroups: [(n + 15) / 16, (mk + 15) / 16, 1], needs_barrier: false,
+                });
+            }
         }
-
         } // end if mega_dispatches logit chunks
 
         // Scratch buffers for argmax (not used yet — keep CPU argmax for now)
@@ -1073,6 +1111,7 @@ impl Phi4Model {
 
         Phi4Model { config, embedding, output_norm, layers, buf_a, buf_c, logits_buf, emb_bufs, rope_factors,
                     attn_q_buf, attn_out_buf, kv_bufs, logit_out_bufs,
+                    gpu_output_weight, gpu_logit_out,
                     gpu_hidden, gpu_normed, gpu_qkv, gpu_gate_up, gpu_ffn_mid, gpu_tmp, gpu_rope_factors,
                     mega_dispatches, gpu_output_norm_w, gpu_logits, gpu_argmax_scratch, gpu_argmax_result }
     }
@@ -1153,11 +1192,19 @@ impl Phi4Model {
         }
         // Output norm dispatch (index n_layer_dispatches)
         push_data.push(norm_push.clone());
-        // Logit chunk dispatches (indices n_layer_dispatches+1 ..)
-        for (_, chunk_n) in &self.emb_bufs {
-            let n = *chunk_n as u32;
-            let push: Vec<u8> = [1u32, D_MODEL as u32, n].iter().flat_map(|v| v.to_le_bytes()).collect();
+        // Logit projection dispatch(es)
+        if self.gpu_output_weight.is_some() {
+            // Single quantized matmul dispatch
+            let (_, _, k, n) = self.gpu_output_weight.as_ref().unwrap();
+            let push: Vec<u8> = [*k, *n].iter().flat_map(|v| v.to_le_bytes()).collect();
             push_data.push(push);
+        } else {
+            // F32 fallback: chunked matmul_tiled dispatches
+            for (_, chunk_n) in &self.emb_bufs {
+                let n = *chunk_n as u32;
+                let push: Vec<u8> = [1u32, D_MODEL as u32, n].iter().flat_map(|v| v.to_le_bytes()).collect();
+                push_data.push(push);
+            }
         }
 
         let dispatches: Vec<(&str, DescSetHandle, &[u8], [u32; 3], bool)> = self.mega_dispatches.iter()
@@ -1172,25 +1219,38 @@ impl Phi4Model {
         // CPU argmax directly from mapped logit output buffers (zero-copy)
         let mut best_val = f32::NEG_INFINITY;
         let mut best_id = 0u32;
-        let mut vocab_offset = 0u32;
-        for (i, (_, chunk_n)) in self.emb_bufs.iter().enumerate() {
-            let n = *chunk_n;
-            let src = std::slice::from_raw_parts(self.logit_out_bufs[i].mapped as *const f32, n);
-            for j in 0..n {
-                if src[j] > best_val { best_val = src[j]; best_id = vocab_offset + j as u32; }
+        if let Some(ref lo) = self.gpu_logit_out {
+            // Single-buffer quantized logit path
+            let src = std::slice::from_raw_parts(lo.mapped as *const f32, VOCAB_SIZE);
+            for j in 0..VOCAB_SIZE {
+                if src[j] > best_val { best_val = src[j]; best_id = j as u32; }
             }
-            vocab_offset += n as u32;
+        } else {
+            // Chunked F32 fallback
+            let mut vocab_offset = 0u32;
+            for (i, (_, chunk_n)) in self.emb_bufs.iter().enumerate() {
+                let n = *chunk_n;
+                let src = std::slice::from_raw_parts(self.logit_out_bufs[i].mapped as *const f32, n);
+                for j in 0..n {
+                    if src[j] > best_val { best_val = src[j]; best_id = vocab_offset + j as u32; }
+                }
+                vocab_offset += n as u32;
+            }
         }
 
-        // Still return logits for compatibility, but the hot path just needs best_id
-        // (caller can access self.last_best_id if needed)
+        // Return logits for compatibility
         let mut logits = vec![0.0f32; VOCAB_SIZE];
-        vocab_offset = 0;
-        for (i, (_, chunk_n)) in self.emb_bufs.iter().enumerate() {
-            let n = *chunk_n;
-            let src = std::slice::from_raw_parts(self.logit_out_bufs[i].mapped as *const f32, n);
-            logits[vocab_offset as usize..(vocab_offset as usize + n)].copy_from_slice(src);
-            vocab_offset += n as u32;
+        if let Some(ref lo) = self.gpu_logit_out {
+            let src = std::slice::from_raw_parts(lo.mapped as *const f32, VOCAB_SIZE);
+            logits.copy_from_slice(src);
+        } else {
+            let mut vocab_offset = 0usize;
+            for (i, (_, chunk_n)) in self.emb_bufs.iter().enumerate() {
+                let n = *chunk_n;
+                let src = std::slice::from_raw_parts(self.logit_out_bufs[i].mapped as *const f32, n);
+                logits[vocab_offset..vocab_offset + n].copy_from_slice(src);
+                vocab_offset += n;
+            }
         }
         logits
     }
