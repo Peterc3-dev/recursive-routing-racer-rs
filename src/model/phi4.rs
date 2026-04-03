@@ -117,37 +117,35 @@ const ROPE_ATTN_FACTOR: f32 = 1.190238;
 
 /// Quant type determines which shader + block size to use
 #[derive(Clone, Copy)]
-enum QType { Q4K, Q5K, Q6K, GPUQ4, GPUQ5, GPUQ6, F32 }
+enum QType { Q4K, Q5K, Q6K, F32 }
 
 impl QType {
     fn shader_name(&self) -> &str {
         match self {
             QType::Q4K => "matmul_q4k", QType::Q5K => "matmul_q5k", QType::Q6K => "matmul_q6k",
-            QType::GPUQ4 => "matmul_gpuq4", QType::GPUQ5 => "matmul_gpuq5", QType::GPUQ6 => "matmul_gpuq6",
             QType::F32 => "matmul_tiled",
         }
     }
     fn batch_shader_name(&self) -> &str {
         match self {
-            QType::Q4K | QType::GPUQ4 => "matmul_gpuq4_batch",
-            QType::Q5K | QType::GPUQ5 => "matmul_gpuq5_batch",
-            QType::Q6K | QType::GPUQ6 => "matmul_gpuq6_batch",
-            QType::F32 => "matmul_tiled",  // TODO: F32 batch shader
+            QType::Q4K => "matmul_q4k_batch",
+            QType::Q5K => "matmul_q5k_batch",
+            QType::Q6K => "matmul_q6k_batch",
+            QType::F32 => "matmul_tiled",
         }
     }
     fn fused_shader_name(&self) -> &str {
         match self {
-            QType::Q4K | QType::GPUQ4 => "fused_norm_matmul_q4k",
-            QType::Q5K | QType::GPUQ5 => "fused_norm_matmul_q5k",
-            QType::Q6K | QType::GPUQ6 => "fused_norm_matmul_q6k",
+            QType::Q4K => "fused_norm_matmul_q4k",
+            QType::Q5K => "fused_norm_matmul_q5k",
+            QType::Q6K => "fused_norm_matmul_q6k",
             QType::F32 => "matmul_tiled",
         }
     }
     fn block_bytes(&self) -> usize {
         match self {
             QType::Q4K => 144, QType::Q5K => 176, QType::Q6K => 210,
-            QType::GPUQ4 => 192, QType::GPUQ5 | QType::GPUQ6 => 320,
-            QType::F32 => 1024, // 256 elements * 4 bytes (not block-based)
+            QType::F32 => 1024,
         }
     }
     fn workgroups(&self, n: u32) -> u32 { n }
@@ -727,12 +725,9 @@ impl Phi4Model {
         engine.get_pipeline("fused_norm_matmul_q4k", 4, 8);
         engine.get_pipeline("fused_norm_matmul_q5k", 4, 8);
         engine.get_pipeline("fused_norm_matmul_q6k", 4, 8);
-        engine.get_pipeline("matmul_gpuq4", 3, 8);
-        engine.get_pipeline("matmul_gpuq5", 3, 8);
-        engine.get_pipeline("matmul_gpuq6", 3, 8);
-        engine.get_pipeline("matmul_gpuq4_batch", 3, 12);  // K, N, M
-        engine.get_pipeline("matmul_gpuq5_batch", 3, 12);
-        engine.get_pipeline("matmul_gpuq6_batch", 3, 12);
+        engine.get_pipeline("matmul_q4k_batch", 3, 12);  // K, N, M
+        engine.get_pipeline("matmul_q5k_batch", 3, 12);
+        engine.get_pipeline("matmul_q6k_batch", 3, 12);
         engine.get_pipeline("rope", 2, 20);
         engine.get_pipeline("rope_kv_store", 4, 28);  // 7 push u32s          // 5 push u32s = 20 bytes
         engine.get_pipeline("silu_gate", 2, 4);      // 1 push u32
@@ -742,7 +737,7 @@ impl Phi4Model {
         let mut layers = Vec::with_capacity(config.n_layers);
         let mut total_gpu: u64 = 0;
 
-        // Helper: load a weight tensor, repack to GPU-native format
+        // Helper: load a weight tensor — raw GGUF bytes directly to GPU (no repacking)
         fn load_weight_gpu(gguf: &GGUFModel, engine: &ComputeEngine, name: &str, total: &mut u64) -> (GpuBuffer, QType, u32, u32) {
             let info = gguf.tensor_infos.iter().find(|t| t.name == name)
                 .unwrap_or_else(|| panic!("Tensor not found: {}", name));
@@ -750,26 +745,17 @@ impl Phi4Model {
             let ne0 = info.shape[0] as u32;
             let ne1 = info.shape[1] as u32;
             let raw_bytes = gguf.tensor_bytes(name);
-            let n_elements = ne0 as usize * ne1 as usize;
-            let (data, qtype) = match gguf_qtype {
-                QType::Q4K => (repack_q4k(raw_bytes, n_elements), QType::GPUQ4),
-                QType::Q5K => (repack_q5k(raw_bytes, n_elements), QType::GPUQ5),
-                QType::Q6K => (repack_q6k(raw_bytes, n_elements), QType::GPUQ6),
+            let data: Vec<u8> = match gguf_qtype {
                 QType::F32 => {
-                    // Non-K-quant type — dequant to F32 for matmul_tiled shader
-                    // Transpose to [K, N] row-major for matmul_tiled (which expects B[K*N])
                     let f32_data = dequant_tensor_f32(gguf, name);
-                    // GGUF stores [ne0=K, ne1=N] row-major. matmul_tiled expects column-major B[K,N].
-                    // The data is already in the right layout: N rows of K elements each.
-                    let bytes: Vec<u8> = f32_data.iter().flat_map(|f| f.to_le_bytes()).collect();
-                    (bytes, QType::F32)
+                    f32_data.iter().flat_map(|f| f.to_le_bytes()).collect()
                 }
-                _ => (raw_bytes.to_vec(), gguf_qtype),
+                _ => raw_bytes.to_vec(),  // Q4_K/Q5_K/Q6_K: raw GGUF bytes, no repack
             };
             let buf = unsafe { engine.alloc_buffer(data.len() as u64) };
             unsafe { upload_bytes(&buf, &data) };
             *total += data.len() as u64;
-            (buf, qtype, ne0, ne1)
+            (buf, gguf_qtype, ne0, ne1)
         }
 
         // Helper: try to load a tensor, return None if it doesn't exist
