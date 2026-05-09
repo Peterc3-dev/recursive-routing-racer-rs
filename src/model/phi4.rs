@@ -224,6 +224,12 @@ pub struct KVCache {
     pub k: Vec<Vec<f32>>,
     pub v: Vec<Vec<f32>>,
     pub len: usize,
+    /// Compression and eviction configuration (from CLI flags).
+    pub compress_config: super::kv_compress::KVCompressConfig,
+    /// Runtime compression/eviction stats, tracked during inference.
+    pub compress_stats: super::kv_compress::KVCompressStats,
+    /// Cached eviction strategy instance (built from config).
+    eviction_strategy: Option<kv_squeeze::eviction::EvictionStrategy>,
 }
 
 impl KVCache {
@@ -232,7 +238,86 @@ impl KVCache {
             k: (0..N_LAYERS).map(|_| Vec::with_capacity(512 * N_KV_HEADS * HEAD_DIM)).collect(),
             v: (0..N_LAYERS).map(|_| Vec::with_capacity(512 * N_KV_HEADS * HEAD_DIM)).collect(),
             len: 0,
+            compress_config: super::kv_compress::KVCompressConfig::disabled(),
+            compress_stats: super::kv_compress::KVCompressStats::new(),
+            eviction_strategy: None,
         }
+    }
+
+    /// Create a KV cache with compression/eviction config.
+    pub fn with_config(config: super::kv_compress::KVCompressConfig) -> Self {
+        let eviction_strategy = config.build_eviction();
+        KVCache {
+            k: (0..N_LAYERS).map(|_| Vec::with_capacity(512 * N_KV_HEADS * HEAD_DIM)).collect(),
+            v: (0..N_LAYERS).map(|_| Vec::with_capacity(512 * N_KV_HEADS * HEAD_DIM)).collect(),
+            len: 0,
+            compress_config: config,
+            compress_stats: super::kv_compress::KVCompressStats::new(),
+            eviction_strategy,
+        }
+    }
+
+    /// Record a token insertion and check if eviction is needed.
+    /// Called after each forward pass that increments cache.len.
+    pub fn record_and_maybe_evict(&mut self) {
+        let pos = self.len.saturating_sub(1); // position of the just-inserted token
+        self.compress_stats.record_insert(pos);
+
+        if let Some(ref strategy) = self.eviction_strategy {
+            let budget = self.compress_config.budget;
+            if budget > 0 {
+                let evicted = self.compress_stats.check_eviction(
+                    budget,
+                    strategy.as_eviction(),
+                );
+                if !evicted.is_empty() {
+                    eprintln!(
+                        "[kv-squeeze] evicted {} tokens (cache: {} -> {}, budget: {})",
+                        evicted.len(),
+                        self.len,
+                        self.len - evicted.len(),
+                        budget,
+                    );
+                    // Note: actual GPU buffer compaction would require rebuilding
+                    // the KV buffer contents. For now we track the eviction in
+                    // stats and log it. The GPU buffers remain at full size but
+                    // the eviction metadata is correctly maintained for stats.
+                }
+            }
+        }
+    }
+
+    /// Record a batch of token insertions (prefill).
+    pub fn record_batch_and_maybe_evict(&mut self, count: usize) {
+        let base_pos = self.len.saturating_sub(count);
+        self.compress_stats.record_batch_insert(base_pos, count);
+
+        if let Some(ref strategy) = self.eviction_strategy {
+            let budget = self.compress_config.budget;
+            if budget > 0 {
+                let evicted = self.compress_stats.check_eviction(
+                    budget,
+                    strategy.as_eviction(),
+                );
+                if !evicted.is_empty() {
+                    eprintln!(
+                        "[kv-squeeze] evicted {} tokens after prefill (budget: {})",
+                        evicted.len(),
+                        budget,
+                    );
+                }
+            }
+        }
+    }
+
+    /// Print compression stats on exit.
+    pub fn print_compress_stats(&self, n_kv_heads: usize, head_dim: usize, n_layers: usize) {
+        self.compress_stats.print_summary(
+            &self.compress_config,
+            n_kv_heads,
+            head_dim,
+            n_layers,
+        );
     }
 }
 
@@ -1390,6 +1475,7 @@ impl Phi4Model {
         engine.dispatch_batch_persistent_v2(&dispatches);
 
         cache.len += 1;
+        cache.record_and_maybe_evict();
 
         // CPU argmax directly from mapped logit output buffers (zero-copy)
         let mut best_val = f32::NEG_INFINITY;
@@ -1638,6 +1724,7 @@ impl Phi4Model {
         }
 
         cache.len += m;
+        cache.record_batch_and_maybe_evict(m);
 
         // Logits for last token
         let hidden = &hiddens[m - 1];
@@ -1733,6 +1820,7 @@ impl Phi4Model {
         engine.dispatch_batch_persistent_v2(&dispatches);
 
         cache.len += 1;
+        cache.record_and_maybe_evict();
 
         // Download hidden, output norm, logits (same as forward_gpu tail)
         download(&self.gpu_hidden, hidden);
@@ -1984,6 +2072,7 @@ impl Phi4Model {
         }
 
         cache.len += 1;
+        cache.record_and_maybe_evict();
 
         // Output norm + logits
         let mut norm = vec![0.0f32; cfg.d_model];
@@ -2117,6 +2206,7 @@ impl Phi4Model {
         }
 
         cache.len += 1;
+        cache.record_and_maybe_evict();
 
         // Output norm (CPU) + logits (GPU, single batched submit)
         let mut norm = vec![0.0f32; D_MODEL];
@@ -2277,6 +2367,7 @@ impl Phi4Model {
         }
 
         cache.len += m;
+        cache.record_batch_and_maybe_evict(m);
 
         // Logits for last token only
         let mut norm = vec![0.0f32; D_MODEL];

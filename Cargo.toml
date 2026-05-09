@@ -10,6 +10,7 @@ ash-window = "0.13"
 memmap2 = "0.9"
 half = { version = "2.4", features = ["std"] }
 rayon = "1.10"
+kv-squeeze = { path = "../kv-squeeze" }
 
 [profile.release]
 opt-level = 3
